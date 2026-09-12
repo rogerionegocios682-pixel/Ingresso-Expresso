@@ -1,0 +1,6 @@
+{
+  "name": "Ingressos Eventos",
+  "description": "Plataforma SaaS moderna de venda de ingressos digitais para eventos com QR Code único, PDV rápido, envio WhatsApp e check-in em tempo real.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
