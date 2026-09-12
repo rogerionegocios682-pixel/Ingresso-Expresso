@@ -14,7 +14,9 @@ import {
   Clock,
   Ticket as TicketIcon,
   Volume2,
-  VolumeX
+  VolumeX,
+  Cloud,
+  Loader2
 } from 'lucide-react';
 import { User, ValidationResult, Event } from '../types';
 import { StorageService } from '../services/storage';
@@ -25,14 +27,32 @@ interface CheckInViewProps {
 }
 
 export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
+  if (!['MASTER', 'ADMIN', 'DOORMAN', 'CHECKIN'].includes(currentUser.role)) {
+    return (
+      <div className="bg-white p-8 rounded-2xl border border-rose-200 text-center space-y-3">
+        <p className="text-rose-600 font-bold">Acesso restrito à equipe de portaria e administração.</p>
+      </div>
+    );
+  }
+
   const companyId = StorageService.getCurrentCompanyId();
   const allEvents = StorageService.getEvents(currentUser.role === 'MASTER' ? undefined : companyId);
 
-  const [selectedEventId, setSelectedEventId] = useState<string>(allEvents[0]?.id || '');
+  const [selectedEventId, setSelectedEventId] = useState<string>('all');
   const [manualCode, setManualCode] = useState<string>('');
   const [isScanning, setIsScanning] = useState<boolean>(false);
   const [cameraError, setCameraError] = useState<string>('');
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
+  const [isValidating, setIsValidating] = useState<boolean>(false);
+  const [, setStoreTick] = useState<number>(0);
+
+  // Re-render when database updates
+  useEffect(() => {
+    const unsubscribe = StorageService.subscribe(() => {
+      setStoreTick(t => t + 1);
+    });
+    return unsubscribe;
+  }, []);
 
   // Result state
   const [validationResult, setValidationResult] = useState<ValidationResult | null>(null);
@@ -164,35 +184,44 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
     };
   }, []);
 
-  const handleProcessCode = (codeStr: string) => {
+  const handleProcessCode = async (codeStr: string) => {
     const clean = codeStr.trim();
     if (!clean) return;
 
     setConfirmedSuccess(false);
-    const res = StorageService.validateTicket(clean, selectedEventId, currentUser);
-    setValidationResult(res);
+    setIsValidating(true);
+    try {
+      const res = await StorageService.validateTicketAsync(
+        clean,
+        selectedEventId === 'all' ? undefined : selectedEventId,
+        currentUser
+      );
+      setValidationResult(res);
 
-    // Audio feedback
-    if (res.status === 'VALID') {
-      playFeedbackSound('success');
-    } else if (res.status === 'ALREADY_USED') {
-      playFeedbackSound('warning');
-    } else {
-      playFeedbackSound('error');
+      // Audio feedback
+      if (res.status === 'VALID') {
+        playFeedbackSound('success');
+      } else if (res.status === 'ALREADY_USED') {
+        playFeedbackSound('warning');
+      } else {
+        playFeedbackSound('error');
+      }
+
+      // Add to recent scans log
+      setRecentScans(prev => [
+        {
+          id: `scan-${Date.now()}`,
+          code: clean,
+          customer: res.ticket?.customerName || 'Não identificado',
+          ticketType: res.ticket?.ticketTypeName || '-',
+          time: new Date().toLocaleTimeString('pt-BR'),
+          status: res.status === 'VALID' ? 'VALID' : res.status === 'ALREADY_USED' ? 'ALREADY_USED' : res.status === 'CANCELLED' ? 'CANCELLED' : 'INVALID'
+        },
+        ...prev.slice(0, 9)
+      ]);
+    } finally {
+      setIsValidating(false);
     }
-
-    // Add to recent scans log
-    setRecentScans(prev => [
-      {
-        id: `scan-${Date.now()}`,
-        code: clean,
-        customer: res.ticket?.customerName || 'Não identificado',
-        ticketType: res.ticket?.ticketTypeName || '-',
-        time: new Date().toLocaleTimeString('pt-BR'),
-        status: res.status === 'VALID' ? 'VALID' : res.status === 'ALREADY_USED' ? 'ALREADY_USED' : res.status === 'CANCELLED' ? 'CANCELLED' : 'INVALID'
-      },
-      ...prev.slice(0, 9)
-    ]);
   };
 
   const handleConfirmEntry = () => {
@@ -212,8 +241,11 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
     startCamera();
   };
 
-  // Stats for the active event
-  const eventStats = StorageService.getDashboardStats(companyId, selectedEventId);
+  // Stats for the active event or all events
+  const eventStats = StorageService.getDashboardStats(
+    currentUser.role === 'MASTER' ? undefined : companyId,
+    selectedEventId === 'all' ? undefined : selectedEventId
+  );
 
   return (
     <div className="max-w-4xl mx-auto space-y-5">
@@ -225,8 +257,14 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
               <QrCode className="w-6 h-6" />
             </div>
             <div>
-              <h1 className="text-xl font-bold text-slate-900">Check-in na Portaria</h1>
-              <p className="text-xs text-slate-500">Validação instantânea e segura de ingressos com controle antifraude</p>
+              <div className="flex items-center gap-2 flex-wrap">
+                <h1 className="text-xl font-bold text-slate-900">Check-in na Portaria</h1>
+                <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full bg-emerald-50 border border-emerald-200 text-[11px] font-semibold text-emerald-700">
+                  <Cloud className="w-3 h-3 text-emerald-600" />
+                  Banco em Nuvem Conectado
+                </span>
+              </div>
+              <p className="text-xs text-slate-500">Validação instantânea e segura de ingressos com controle antifraude em tempo real</p>
             </div>
           </div>
         </div>
@@ -253,6 +291,7 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
             }}
             className="px-3 py-2 text-xs font-semibold rounded-xl border border-slate-300 bg-white text-slate-800 focus:ring-2 focus:ring-emerald-500"
           >
+            <option value="all">Todos os Eventos (Geral)</option>
             {allEvents.map(evt => (
               <option key={evt.id} value={evt.id}>
                 {evt.name}
@@ -382,13 +421,29 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
                 <button
                   type="button"
                   onClick={() => handleProcessCode(manualCode)}
-                  disabled={!manualCode.trim()}
-                  className="px-5 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white text-sm font-bold transition-colors cursor-pointer"
+                  disabled={!manualCode.trim() || isValidating}
+                  className="px-5 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white text-sm font-bold transition-colors cursor-pointer inline-flex items-center gap-2"
                 >
-                  Consultar
+                  {isValidating ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>Validando...</span>
+                    </>
+                  ) : (
+                    'Consultar'
+                  )}
                 </button>
               </div>
             </div>
+          </div>
+        )}
+
+        {/* Validation in progress */}
+        {isValidating && !validationResult && (
+          <div className="p-8 rounded-2xl bg-indigo-50/70 border border-indigo-200 text-center space-y-2">
+            <Loader2 className="w-8 h-8 text-indigo-600 animate-spin mx-auto" />
+            <p className="text-sm font-bold text-slate-800">Consultando banco de dados em nuvem...</p>
+            <p className="text-xs text-slate-500">Verificando autenticidade e status antifraude do ingresso</p>
           </div>
         )}
 

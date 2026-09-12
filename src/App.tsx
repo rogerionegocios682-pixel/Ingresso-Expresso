@@ -1,7 +1,9 @@
 import React, { useState, useEffect } from 'react';
 import { User } from './types';
-import { StorageService } from './services/storage';
-import { Layout, NavigationTab } from './components/Layout';
+import { StorageService, initFirestoreSync } from './services/storage';
+import { Layout } from './components/Layout';
+import { NavigationTab, isTabAllowedForRole, getDefaultTabForRole } from './services/permissions';
+import { AccessDeniedView } from './components/AccessDeniedView';
 import { LoginView } from './components/LoginView';
 import { DashboardView } from './components/DashboardView';
 import { EventDashboardView } from './components/EventDashboardView';
@@ -24,15 +26,44 @@ export default function App() {
       try {
         return JSON.parse(saved);
       } catch (e) {
-        // Fallback to initial admin
+        // Fallback
       }
     }
     const users = StorageService.getUsers();
-    return users[0] || null;
+    // Default to admin for initial state
+    return users.find(u => u.role === 'ADMIN') || users[0] || null;
   });
 
-  // Current active navigation tab
-  const [activeTab, setActiveTab] = useState<NavigationTab>('dashboard');
+  // Current active navigation tab (safely matching user role)
+  const [activeTab, setActiveTab] = useState<NavigationTab>(() => {
+    const saved = localStorage.getItem('ingressos_current_user');
+    if (saved) {
+      try {
+        const u = JSON.parse(saved);
+        if (u?.role) {
+          return getDefaultTabForRole(u.role);
+        }
+      } catch (e) {
+        // Fallback
+      }
+    }
+    return 'dashboard';
+  });
+
+  // Initialize Firestore real-time cloud sync
+  useEffect(() => {
+    initFirestoreSync();
+  }, []);
+
+  // Guard: if current user or role changes, make sure active tab is strictly allowed
+  useEffect(() => {
+    if (currentUser) {
+      if (!isTabAllowedForRole(currentUser.role, activeTab)) {
+        setActiveTab(getDefaultTabForRole(currentUser.role));
+        setFocusedEventId(null);
+      }
+    }
+  }, [currentUser, activeTab]);
 
   // Currently focused event (for event dashboard or direct selling)
   const [focusedEventId, setFocusedEventId] = useState<string | null>(null);
@@ -41,51 +72,64 @@ export default function App() {
   const [targetBatchEventId, setTargetBatchEventId] = useState<string | undefined>(undefined);
   const [targetPOSEventId, setTargetPOSEventId] = useState<string | undefined>(undefined);
 
-  // Sync current user to local storage
+  // Sync current user to local storage and route to their natural workspace
   const handleLogin = (user: User) => {
     setCurrentUser(user);
     localStorage.setItem('ingressos_current_user', JSON.stringify(user));
+    StorageService.setCurrentUser(user);
 
-    // Redirect to natural landing tab according to role
-    if (user.role === 'SELLER') {
-      setActiveTab('pos');
-    } else if (user.role === 'DOORMAN' || user.role === 'CHECKIN') {
-      setActiveTab('checkin');
-    } else {
-      setActiveTab('dashboard');
-    }
+    // Redirect strictly to allowed initial tab
+    const initialTab = getDefaultTabForRole(user.role);
+    setActiveTab(initialTab);
+    setFocusedEventId(null);
   };
 
   const handleLogout = () => {
     setCurrentUser(null);
     localStorage.removeItem('ingressos_current_user');
+    StorageService.setCurrentUser(null);
   };
 
   // Switch tab safely ensuring role permissions
   const handleSelectTab = (tab: NavigationTab) => {
+    if (!currentUser || !isTabAllowedForRole(currentUser.role, tab)) {
+      return;
+    }
     setFocusedEventId(null);
     setActiveTab(tab);
   };
 
-  // Drilldown to specific event dashboard
+  // Drilldown to specific event dashboard (restricted to Master and Admin)
   const handleOpenEventDashboard = (eventId: string) => {
+    if (!currentUser || (currentUser.role !== 'MASTER' && currentUser.role !== 'ADMIN')) {
+      return;
+    }
     setFocusedEventId(eventId);
   };
 
-  // Quick navigation helpers from event cards
+  // Quick navigation helpers from event cards (restricted to permitted roles)
   const handleNavigateToBatches = (eventId?: string) => {
+    if (!currentUser || (currentUser.role !== 'MASTER' && currentUser.role !== 'ADMIN')) {
+      return;
+    }
     setTargetBatchEventId(eventId);
     setActiveTab('batches');
     setFocusedEventId(null);
   };
 
   const handleNavigateToPOS = (eventId?: string) => {
+    if (!currentUser || !isTabAllowedForRole(currentUser.role, 'pos')) {
+      return;
+    }
     setTargetPOSEventId(eventId);
     setActiveTab('pos');
     setFocusedEventId(null);
   };
 
   const handleNavigateToCheckIn = (eventId?: string) => {
+    if (!currentUser || !isTabAllowedForRole(currentUser.role, 'checkin')) {
+      return;
+    }
     setActiveTab('checkin');
     setFocusedEventId(null);
   };
@@ -101,8 +145,8 @@ export default function App() {
       onSelectTab={handleSelectTab}
       onLogout={handleLogout}
     >
-      {/* If focused on a specific event, show the Event Dashboard as requested in #32 */}
-      {focusedEventId ? (
+      {/* If focused on a specific event, show the Event Dashboard as requested in #32 (restricted to Master and Admin) */}
+      {focusedEventId && (currentUser.role === 'MASTER' || currentUser.role === 'ADMIN') ? (
         <EventDashboardView
           eventId={focusedEventId}
           currentUser={currentUser}
@@ -113,80 +157,89 @@ export default function App() {
         />
       ) : (
         <>
-          {activeTab === 'dashboard' && (
-            <DashboardView
+          {!isTabAllowedForRole(currentUser.role, activeTab) ? (
+            <AccessDeniedView
               currentUser={currentUser}
-              onSelectEvent={handleOpenEventDashboard}
-              onNavigateToPOS={() => handleNavigateToPOS()}
-              onNavigateToCheckIn={() => handleNavigateToCheckIn()}
+              onNavigateToAllowedTab={handleSelectTab}
             />
-          )}
+          ) : (
+            <>
+              {activeTab === 'dashboard' && (
+                <DashboardView
+                  currentUser={currentUser}
+                  onSelectEvent={handleOpenEventDashboard}
+                  onNavigateToPOS={() => handleNavigateToPOS()}
+                  onNavigateToCheckIn={() => handleNavigateToCheckIn()}
+                />
+              )}
 
-          {activeTab === 'events' && (
-            <EventsView
-              currentUser={currentUser}
-              onSelectEvent={handleOpenEventDashboard}
-              onManageBatches={handleNavigateToBatches}
-              onOpenPOS={handleNavigateToPOS}
-            />
-          )}
+              {activeTab === 'events' && (
+                <EventsView
+                  currentUser={currentUser}
+                  onSelectEvent={handleOpenEventDashboard}
+                  onManageBatches={handleNavigateToBatches}
+                  onOpenPOS={handleNavigateToPOS}
+                />
+              )}
 
-          {activeTab === 'batches' && (
-            <LotsAndTicketsView
-              currentUser={currentUser}
-              initialEventId={targetBatchEventId}
-              onOpenPOS={handleNavigateToPOS}
-            />
-          )}
+              {activeTab === 'batches' && (
+                <LotsAndTicketsView
+                  currentUser={currentUser}
+                  initialEventId={targetBatchEventId}
+                  onOpenPOS={handleNavigateToPOS}
+                />
+              )}
 
-          {activeTab === 'pos' && (
-            <POSView
-              currentUser={currentUser}
-              initialEventId={targetPOSEventId}
-            />
-          )}
+              {activeTab === 'pos' && (
+                <POSView
+                  currentUser={currentUser}
+                  initialEventId={targetPOSEventId}
+                />
+              )}
 
-          {activeTab === 'checkin' && (
-            <CheckInView
-              currentUser={currentUser}
-            />
-          )}
+              {activeTab === 'checkin' && (
+                <CheckInView
+                  currentUser={currentUser}
+                />
+              )}
 
-          {activeTab === 'sales' && (
-            <SalesListView
-              currentUser={currentUser}
-              onOpenPOS={() => handleNavigateToPOS()}
-            />
-          )}
+              {activeTab === 'sales' && (
+                <SalesListView
+                  currentUser={currentUser}
+                  onOpenPOS={() => handleNavigateToPOS()}
+                />
+              )}
 
-          {activeTab === 'tickets' && (
-            <TicketsListView
-              currentUser={currentUser}
-            />
-          )}
+              {activeTab === 'tickets' && (
+                <TicketsListView
+                  currentUser={currentUser}
+                />
+              )}
 
-          {activeTab === 'customers' && (
-            <CustomersView
-              currentUser={currentUser}
-            />
-          )}
+              {activeTab === 'customers' && (
+                <CustomersView
+                  currentUser={currentUser}
+                />
+              )}
 
-          {activeTab === 'users' && (
-            <UsersView
-              currentUser={currentUser}
-            />
-          )}
+              {activeTab === 'users' && (
+                <UsersView
+                  currentUser={currentUser}
+                />
+              )}
 
-          {activeTab === 'reports' && (
-            <ReportsView
-              currentUser={currentUser}
-            />
-          )}
+              {activeTab === 'reports' && (
+                <ReportsView
+                  currentUser={currentUser}
+                />
+              )}
 
-          {activeTab === 'settings' && (
-            <SettingsView
-              currentUser={currentUser}
-            />
+              {activeTab === 'settings' && (
+                <SettingsView
+                  currentUser={currentUser}
+                />
+              )}
+            </>
           )}
         </>
       )}

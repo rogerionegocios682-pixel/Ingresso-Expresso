@@ -25,6 +25,7 @@ interface TicketDisplayModalProps {
   onClose: () => void;
   onNewSale: () => void;
   onPrintSuccess?: (info: { ticketLabel: string; count: number; timestamp: string; eventName: string }) => void;
+  autoCloseOnPrint?: boolean;
 }
 
 interface PrintNotification {
@@ -39,7 +40,8 @@ export const TicketDisplayModal: React.FC<TicketDisplayModalProps> = ({
   event,
   onClose,
   onNewSale,
-  onPrintSuccess
+  onPrintSuccess,
+  autoCloseOnPrint = true
 }) => {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [qrMap, setQrMap] = useState<Record<string, string>>({});
@@ -120,11 +122,30 @@ export const TicketDisplayModal: React.FC<TicketDisplayModalProps> = ({
     }, 7000);
 
     // Send print command to browser print service
+    let hasAutoClosed = false;
+    const triggerAutoClose = () => {
+      if (!hasAutoClosed && autoCloseOnPrint) {
+        hasAutoClosed = true;
+        onClose();
+      }
+    };
+
+    const handleAfterPrint = () => {
+      window.removeEventListener('afterprint', handleAfterPrint);
+      triggerAutoClose();
+    };
+    window.addEventListener('afterprint', handleAfterPrint, { once: true });
+
     setTimeout(() => {
       try {
         window.print();
       } catch (err) {
         console.error('Erro ao acionar serviço de impressão:', err);
+      } finally {
+        // Automatically close modal overlay once print service has been triggered
+        setTimeout(() => {
+          triggerAutoClose();
+        }, 150);
       }
     }, 80);
   };

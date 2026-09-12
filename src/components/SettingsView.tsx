@@ -19,6 +19,14 @@ interface SettingsViewProps {
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({ currentUser }) => {
+  if (currentUser.role !== 'MASTER' && currentUser.role !== 'ADMIN') {
+    return (
+      <div className="bg-white p-8 rounded-2xl border border-rose-200 text-center space-y-3">
+        <p className="text-rose-600 font-bold">Acesso restrito à administração da plataforma.</p>
+      </div>
+    );
+  }
+
   const company = StorageService.getCurrentCompany();
   const allCompanies = StorageService.getCompanies();
 

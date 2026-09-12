@@ -19,19 +19,9 @@ import {
 } from 'lucide-react';
 import { User, UserRole } from '../types';
 import { StorageService } from '../services/storage';
+import { NavigationTab, isTabAllowedForRole, getRoleDisplayName } from '../services/permissions';
 
-export type NavigationTab =
-  | 'dashboard'
-  | 'events'
-  | 'batches'
-  | 'pos'
-  | 'checkin'
-  | 'sales'
-  | 'tickets'
-  | 'customers'
-  | 'users'
-  | 'reports'
-  | 'settings';
+export type { NavigationTab };
 
 interface LayoutProps {
   currentUser: User;
@@ -51,23 +41,27 @@ export const Layout: React.FC<LayoutProps> = ({
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
   const company = StorageService.getCurrentCompany();
 
-  // Menu items matching requirement #31
+  // Menu items matching requirement #31 and strict role permissions
   const menuItems = [
-    { id: 'dashboard' as NavigationTab, label: 'Dashboard', icon: LayoutDashboard, roles: ['MASTER', 'ADMIN'] },
-    { id: 'events' as NavigationTab, label: 'Eventos', icon: Calendar, roles: ['MASTER', 'ADMIN'] },
-    { id: 'batches' as NavigationTab, label: 'Lotes / Ingressos', icon: Layers, roles: ['MASTER', 'ADMIN'] },
-    { id: 'pos' as NavigationTab, label: 'PDV / Vender', icon: ShoppingCart, roles: ['MASTER', 'ADMIN', 'SELLER'] },
-    { id: 'checkin' as NavigationTab, label: 'Portaria / Check-in', icon: QrCode, roles: ['MASTER', 'ADMIN', 'DOORMAN', 'CHECKIN'] },
-    { id: 'sales' as NavigationTab, label: 'Vendas', icon: Receipt, roles: ['MASTER', 'ADMIN', 'SELLER'] },
-    { id: 'tickets' as NavigationTab, label: 'Ingressos', icon: Ticket, roles: ['MASTER', 'ADMIN'] },
-    { id: 'customers' as NavigationTab, label: 'Clientes', icon: Users, roles: ['MASTER', 'ADMIN', 'SELLER'] },
-    { id: 'users' as NavigationTab, label: 'Usuários / Vendedores', icon: UserCog, roles: ['MASTER', 'ADMIN'] },
-    { id: 'reports' as NavigationTab, label: 'Relatórios', icon: BarChart3, roles: ['MASTER', 'ADMIN'] },
-    { id: 'settings' as NavigationTab, label: 'Configurações', icon: Settings, roles: ['MASTER', 'ADMIN'] }
+    { id: 'dashboard' as NavigationTab, label: 'Dashboard', icon: LayoutDashboard },
+    { id: 'events' as NavigationTab, label: 'Eventos', icon: Calendar },
+    { id: 'batches' as NavigationTab, label: 'Lotes / Ingressos', icon: Layers },
+    { id: 'pos' as NavigationTab, label: 'PDV / Vender', icon: ShoppingCart },
+    { id: 'checkin' as NavigationTab, label: 'Portaria / Check-in', icon: QrCode },
+    {
+      id: 'sales' as NavigationTab,
+      label: currentUser.role === 'SELLER' ? 'Minhas Vendas' : 'Vendas',
+      icon: Receipt
+    },
+    { id: 'tickets' as NavigationTab, label: 'Ingressos', icon: Ticket },
+    { id: 'customers' as NavigationTab, label: 'Clientes', icon: Users },
+    { id: 'users' as NavigationTab, label: 'Usuários / Vendedores', icon: UserCog },
+    { id: 'reports' as NavigationTab, label: 'Relatórios', icon: BarChart3 },
+    { id: 'settings' as NavigationTab, label: 'Configurações', icon: Settings }
   ];
 
-  // Filter menu items by user role
-  const allowedMenuItems = menuItems.filter(item => item.roles.includes(currentUser.role));
+  // Filter menu items by user role strictly based on permissions matrix
+  const allowedMenuItems = menuItems.filter(item => isTabAllowedForRole(currentUser.role, item.id));
 
   const handleTabClick = (tab: NavigationTab) => {
     onSelectTab(tab);
@@ -152,13 +146,7 @@ export const Layout: React.FC<LayoutProps> = ({
             <div className="min-w-0 flex-1">
               <p className="text-xs font-bold text-white truncate">{currentUser.name}</p>
               <span className="inline-block text-[10px] uppercase font-extrabold px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
-                {currentUser.role === 'MASTER'
-                  ? 'Super Admin'
-                  : currentUser.role === 'ADMIN'
-                  ? 'Admin'
-                  : currentUser.role === 'SELLER'
-                  ? 'Vendedor'
-                  : 'Portaria'}
+                {getRoleDisplayName(currentUser.role)}
               </span>
             </div>
           </div>

@@ -1,0 +1,62 @@
+{
+  "entities": {
+    "Ticket": {
+      "title": "Ticket",
+      "description": "Ingresso emitido para evento",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "companyId": { "type": "string" },
+        "eventId": { "type": "string" },
+        "batchId": { "type": "string" },
+        "ticketTypeName": { "type": "string" },
+        "batchName": { "type": "string" },
+        "ticketNumber": { "type": "string" },
+        "validationToken": { "type": "string" },
+        "customerName": { "type": "string" },
+        "customerPhone": { "type": "string" },
+        "price": { "type": "number" },
+        "status": { "type": "string" },
+        "purchaseDate": { "type": "string" },
+        "checkInTime": { "type": "string" }
+      },
+      "required": ["id", "eventId", "ticketNumber", "validationToken", "status"]
+    },
+    "Event": {
+      "title": "Event",
+      "description": "Evento cadastrado no sistema",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "companyId": { "type": "string" },
+        "name": { "type": "string" },
+        "status": { "type": "string" }
+      }
+    },
+    "Sale": {
+      "title": "Sale",
+      "description": "Pedido de venda realizado",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "companyId": { "type": "string" },
+        "saleNumber": { "type": "string" },
+        "totalAmount": { "type": "number" }
+      }
+    }
+  },
+  "firestore": {
+    "/tickets/{ticketId}": {
+      "schema": "Ticket",
+      "description": "Ingressos individuais sincronizados para validação na portaria"
+    },
+    "/events/{eventId}": {
+      "schema": "Event",
+      "description": "Eventos cadastrados"
+    },
+    "/sales/{saleId}": {
+      "schema": "Sale",
+      "description": "Vendas efetuadas"
+    }
+  }
+}

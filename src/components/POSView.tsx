@@ -28,6 +28,14 @@ interface POSViewProps {
 }
 
 export const POSView: React.FC<POSViewProps> = ({ currentUser }) => {
+  if (!['MASTER', 'ADMIN', 'SELLER'].includes(currentUser.role)) {
+    return (
+      <div className="bg-white p-8 rounded-2xl border border-rose-200 text-center space-y-3">
+        <p className="text-rose-600 font-bold">Acesso restrito a vendedores e administradores.</p>
+      </div>
+    );
+  }
+
   const companyId = StorageService.getCurrentCompanyId();
   const allEvents = StorageService.getEvents(currentUser.role === 'MASTER' ? undefined : companyId);
 
@@ -588,9 +596,13 @@ export const POSView: React.FC<POSViewProps> = ({ currentUser }) => {
         <TicketDisplayModal
           tickets={generatedTickets}
           event={currentEvent}
-          onClose={() => setGeneratedTickets(null)}
+          onClose={() => {
+            setGeneratedTickets(null);
+            handleResetForNewSale();
+          }}
           onNewSale={handleResetForNewSale}
           onPrintSuccess={handlePrintSuccess}
+          autoCloseOnPrint={true}
         />
       )}
     </div>

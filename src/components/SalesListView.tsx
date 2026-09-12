@@ -91,15 +91,20 @@ export const SalesListView: React.FC<SalesListViewProps> = ({ currentUser, onOpe
 
   const totalVolume = filteredSales.reduce((a, b) => a + (b.status === 'completed' ? b.totalAmount : 0), 0);
   const totalTickets = filteredSales.reduce((a, b) => a + (b.status === 'completed' ? b.quantity : 0), 0);
+  const totalCommission = filteredSales.reduce((a, b) => a + (b.status === 'completed' ? (b.sellerCommission || 0) : 0), 0);
 
   return (
     <div className="space-y-6">
       {/* Header */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 bg-white p-5 rounded-2xl border border-slate-200/80 shadow-xs">
         <div>
-          <h1 className="text-xl sm:text-2xl font-bold text-slate-900">Histórico de Vendas</h1>
+          <h1 className="text-xl sm:text-2xl font-bold text-slate-900">
+            {currentUser.role === 'SELLER' ? 'Minhas Vendas' : 'Histórico de Vendas'}
+          </h1>
           <p className="text-xs sm:text-sm text-slate-500">
-            Registro detalhado de pedidos, canais de venda, formas de pagamento e comissões
+            {currentUser.role === 'SELLER'
+              ? 'Acompanhe seus pedidos emitidos no PDV e suas comissões acumuladas'
+              : 'Registro detalhado de pedidos, canais de venda, formas de pagamento e comissões'}
           </p>
         </div>
 
@@ -131,14 +136,27 @@ export const SalesListView: React.FC<SalesListViewProps> = ({ currentUser, onOpe
           <p className="text-xl font-black text-indigo-700">{totalTickets} un.</p>
         </div>
         <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-2xs">
-          <span className="text-[11px] text-slate-500 font-semibold uppercase">Valor Faturado</span>
+          <span className="text-[11px] text-slate-500 font-semibold uppercase">
+            {currentUser.role === 'SELLER' ? 'Minhas Vendas (R$)' : 'Valor Faturado'}
+          </span>
           <p className="text-xl font-black text-emerald-700">{formatCurrency(totalVolume)}</p>
         </div>
         <div className="bg-white p-3.5 rounded-xl border border-slate-200 shadow-2xs">
-          <span className="text-[11px] text-slate-500 font-semibold uppercase">Ticket Médio</span>
-          <p className="text-xl font-black text-slate-900">
-            {filteredSales.length > 0 ? formatCurrency(totalVolume / filteredSales.length) : 'R$ 0,00'}
-          </p>
+          {currentUser.role === 'SELLER' ? (
+            <>
+              <span className="text-[11px] text-slate-500 font-semibold uppercase">
+                Minha Comissão ({currentUser.commissionRate ?? 5}%)
+              </span>
+              <p className="text-xl font-black text-indigo-700">{formatCurrency(totalCommission)}</p>
+            </>
+          ) : (
+            <>
+              <span className="text-[11px] text-slate-500 font-semibold uppercase">Ticket Médio</span>
+              <p className="text-xl font-black text-slate-900">
+                {filteredSales.length > 0 ? formatCurrency(totalVolume / filteredSales.length) : 'R$ 0,00'}
+              </p>
+            </>
+          )}
         </div>
       </div>
 

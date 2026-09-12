@@ -20,6 +20,14 @@ interface CustomersViewProps {
 }
 
 export const CustomersView: React.FC<CustomersViewProps> = ({ currentUser }) => {
+  if (currentUser.role !== 'MASTER' && currentUser.role !== 'ADMIN') {
+    return (
+      <div className="bg-white p-8 rounded-2xl border border-rose-200 text-center space-y-3">
+        <p className="text-rose-600 font-bold">Acesso restrito à administração da plataforma.</p>
+      </div>
+    );
+  }
+
   const companyId = StorageService.getCurrentCompanyId();
   const [customers, setCustomers] = useState<Customer[]>(() =>
     StorageService.getCustomers(currentUser.role === 'MASTER' ? undefined : companyId)

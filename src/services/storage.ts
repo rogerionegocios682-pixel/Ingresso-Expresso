@@ -20,6 +20,19 @@ import {
   INITIAL_CUSTOMERS,
   INITIAL_AUDIT_LOGS
 } from '../data/initialData';
+import {
+  saveTicketToFirestore,
+  saveTicketsBatchToFirestore,
+  updateTicketStatusInFirestore,
+  saveSaleToFirestore,
+  saveEventToFirestore,
+  saveBatchToFirestore,
+  findTicketInFirestore,
+  subscribeToTickets,
+  subscribeToSales,
+  subscribeToEvents,
+  testFirestoreConnection
+} from './firebase';
 
 const STORAGE_KEYS = {
   COMPANIES: 'ie_companies',
@@ -36,6 +49,66 @@ const STORAGE_KEYS = {
 
 type Listener = () => void;
 const listeners: Set<Listener> = new Set();
+
+let firestoreSyncStarted = false;
+
+export function initFirestoreSync() {
+  if (firestoreSyncStarted) return;
+  firestoreSyncStarted = true;
+
+  testFirestoreConnection();
+
+  // 1. Real-time subscription to cloud tickets
+  subscribeToTickets((remoteTickets) => {
+    if (!remoteTickets || remoteTickets.length === 0) return;
+    const localTickets = getItem<Ticket[]>(STORAGE_KEYS.TICKETS, INITIAL_TICKETS);
+    const remoteMap = new Map<string, Ticket>();
+    remoteTickets.forEach(t => remoteMap.set(t.id, t));
+
+    // Upload any local tickets created offline to Firestore
+    const localOnly: Ticket[] = [];
+    localTickets.forEach(lt => {
+      if (!remoteMap.has(lt.id)) {
+        localOnly.push(lt);
+        remoteMap.set(lt.id, lt);
+      }
+    });
+
+    if (localOnly.length > 0) {
+      saveTicketsBatchToFirestore(localOnly);
+    }
+
+    const merged = Array.from(remoteMap.values());
+    setItem(STORAGE_KEYS.TICKETS, merged);
+  });
+
+  // 2. Real-time subscription to cloud sales
+  subscribeToSales((remoteSales) => {
+    if (!remoteSales || remoteSales.length === 0) return;
+    const localSales = getItem<Sale[]>(STORAGE_KEYS.SALES, INITIAL_SALES);
+    const remoteMap = new Map<string, Sale>();
+    remoteSales.forEach(s => remoteMap.set(s.id, s));
+
+    const localOnly: Sale[] = [];
+    localSales.forEach(ls => {
+      if (!remoteMap.has(ls.id)) {
+        localOnly.push(ls);
+        remoteMap.set(ls.id, ls);
+      }
+    });
+
+    if (localOnly.length > 0) {
+      localOnly.forEach(s => saveSaleToFirestore(s));
+    }
+
+    const merged = Array.from(remoteMap.values());
+    setItem(STORAGE_KEYS.SALES, merged);
+  });
+
+  // 3. Seed initial default tickets to cloud if needed
+  const initialLocalTickets = getItem<Ticket[]>(STORAGE_KEYS.TICKETS, INITIAL_TICKETS);
+  saveTicketsBatchToFirestore(initialLocalTickets);
+}
 
 function notifyListeners() {
   listeners.forEach(fn => {
@@ -88,6 +161,11 @@ export function generateValidationToken(ticketNumber: string): string {
 }
 
 export const StorageService = {
+  // Real-time store subscription
+  subscribe(listener: Listener): () => void {
+    return subscribeToStore(listener);
+  },
+
   // Auth & Session
   getCurrentUser(): User {
     const stored = getItem<User | null>(STORAGE_KEYS.CURRENT_USER, null);
@@ -333,6 +411,14 @@ export const StorageService = {
     tickets[idx].notes = reason;
     setItem(STORAGE_KEYS.TICKETS, tickets);
 
+    updateTicketStatusInFirestore(ticketId, {
+      status: 'cancelled',
+      cancelledAt: tickets[idx].cancelledAt,
+      cancelReason: reason,
+      cancelledByUserName: operator.name,
+      notes: reason
+    });
+
     this.addAuditLog(
       tickets[idx].companyId,
       operator.id,
@@ -442,9 +528,10 @@ export const StorageService = {
       ticketIds.push(ticketId);
     }
 
-    // Save tickets
+    // Save tickets locally and to Firestore
     allTickets.push(...generatedTickets);
     setItem(STORAGE_KEYS.TICKETS, allTickets);
+    saveTicketsBatchToFirestore(generatedTickets);
 
     // Create Sale record
     const newSale: Sale = {
@@ -474,6 +561,7 @@ export const StorageService = {
 
     sales.unshift(newSale);
     setItem(STORAGE_KEYS.SALES, sales);
+    saveSaleToFirestore(newSale);
 
     // Save or update Customer
     this.upsertCustomer({
@@ -547,15 +635,52 @@ export const StorageService = {
   },
 
   // Anti-fraud & QR Check-In Engine
+  normalizeScannedCode(raw: string): string {
+    let clean = (raw || '').trim();
+    // Remove zero-width / invisible chars
+    clean = clean.replace(/[\u200B-\u200D\uFEFF]/g, '');
+    // Replace unicode hyphens with standard ASCII dash
+    clean = clean.replace(/[\u2010-\u2015\u2212]/g, '-');
+
+    // If QR payload was JSON string (e.g. {"t":"TKT-...", "n":"EVT-..."})
+    if (clean.startsWith('{') && clean.endsWith('}')) {
+      try {
+        const parsed = JSON.parse(clean);
+        if (parsed.t) clean = parsed.t;
+        else if (parsed.validationToken) clean = parsed.validationToken;
+        else if (parsed.n) clean = parsed.n;
+        else if (parsed.ticketNumber) clean = parsed.ticketNumber;
+      } catch {
+        // use raw
+      }
+    }
+
+    // If URL with parameter (e.g. https://.../?token=TKT-... or ?t=TKT-...)
+    if (clean.includes('?') && (clean.includes('token=') || clean.includes('t=') || clean.includes('code='))) {
+      try {
+        const url = new URL(clean);
+        const p = url.searchParams.get('token') || url.searchParams.get('t') || url.searchParams.get('code');
+        if (p) clean = p;
+      } catch {
+        // fallback
+      }
+    }
+
+    return clean.trim().toUpperCase().replace(/[\u2010-\u2015\u2212]/g, '-');
+  },
+
   validateTicket(
     tokenOrNumber: string,
     targetEventId?: string,
     operator?: User
   ): ValidationResult {
-    const clean = tokenOrNumber.trim().toUpperCase();
+    const clean = this.normalizeScannedCode(tokenOrNumber);
     const tickets = getItem<Ticket[]>(STORAGE_KEYS.TICKETS, INITIAL_TICKETS);
     const ticket = tickets.find(
-      t => t.validationToken.toUpperCase() === clean || t.ticketNumber.toUpperCase() === clean
+      t =>
+        t.validationToken.toUpperCase().replace(/[\u2010-\u2015\u2212]/g, '-') === clean ||
+        t.ticketNumber.toUpperCase().replace(/[\u2010-\u2015\u2212]/g, '-') === clean ||
+        t.id === clean
     );
 
     if (!ticket) {
@@ -579,7 +704,7 @@ export const StorageService = {
     const event = this.getEventById(ticket.eventId);
 
     // Event check if restricted to specific event
-    if (targetEventId && ticket.eventId !== targetEventId) {
+    if (targetEventId && targetEventId !== 'all' && targetEventId !== '' && ticket.eventId !== targetEventId) {
       return {
         valid: false,
         status: 'EVENT_MISMATCH',
@@ -654,6 +779,42 @@ export const StorageService = {
     };
   },
 
+  async validateTicketAsync(
+    tokenOrNumber: string,
+    targetEventId?: string,
+    operator?: User
+  ): Promise<ValidationResult> {
+    // 1. Check in local cache
+    const syncRes = this.validateTicket(tokenOrNumber, targetEventId, operator);
+    if (syncRes.valid || syncRes.status === 'ALREADY_USED' || syncRes.status === 'CANCELLED' || syncRes.status === 'EVENT_MISMATCH') {
+      return syncRes;
+    }
+
+    // 2. Not found in local cache - query Cloud Firestore live
+    const clean = this.normalizeScannedCode(tokenOrNumber);
+    try {
+      const remoteTicket = await findTicketInFirestore(clean);
+      if (remoteTicket) {
+        // Cache it in local tickets
+        const tickets = getItem<Ticket[]>(STORAGE_KEYS.TICKETS, INITIAL_TICKETS);
+        const existingIdx = tickets.findIndex(t => t.id === remoteTicket.id);
+        if (existingIdx >= 0) {
+          tickets[existingIdx] = remoteTicket;
+        } else {
+          tickets.push(remoteTicket);
+        }
+        setItem(STORAGE_KEYS.TICKETS, tickets);
+
+        // Re-validate with the freshly fetched remote ticket
+        return this.validateTicket(clean, targetEventId, operator);
+      }
+    } catch (e) {
+      console.warn('Live Firestore ticket lookup error:', e);
+    }
+
+    return syncRes;
+  },
+
   confirmCheckIn(ticketId: string, operator: User): { success: boolean; ticket?: Ticket; error?: string } {
     const tickets = getItem<Ticket[]>(STORAGE_KEYS.TICKETS, INITIAL_TICKETS);
     const idx = tickets.findIndex(t => t.id === ticketId);
@@ -676,6 +837,14 @@ export const StorageService = {
     tickets[idx].usedByUserName = operator.name;
 
     setItem(STORAGE_KEYS.TICKETS, tickets);
+
+    // Sync check-in to Cloud Firestore
+    updateTicketStatusInFirestore(tickets[idx].id, {
+      status: 'used',
+      usedAt: nowIso,
+      usedByUserId: operator.id,
+      usedByUserName: operator.name
+    });
 
     // Audit log
     this.addAuditLog(
