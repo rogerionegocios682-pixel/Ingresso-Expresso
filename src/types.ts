@@ -177,10 +177,14 @@ export interface AuditLog {
 
 export interface ValidationResult {
   valid: boolean;
-  status: 'VALID' | 'ALREADY_USED' | 'INVALID' | 'CANCELLED' | 'EVENT_MISMATCH';
+  status: 'VALID' | 'ALREADY_USED' | 'INVALID' | 'CANCELLED' | 'EVENT_MISMATCH' | 'NON_UNIQUE' | 'BLOCKED';
   message: string;
   ticket?: Ticket;
   event?: Event;
   firstUsedAt?: string;
   firstUsedByName?: string;
+  tokenUnique?: boolean;
+  checkedAt?: string;
+  source?: 'FIRESTORE' | 'LOCAL';
+  scannedCode?: string;
 }

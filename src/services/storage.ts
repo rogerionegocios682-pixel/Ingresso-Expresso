@@ -28,6 +28,8 @@ import {
   saveEventToFirestore,
   saveBatchToFirestore,
   findTicketInFirestore,
+  validateTicketWithFirestore,
+  confirmCheckInWithFirestore,
   subscribeToTickets,
   subscribeToSales,
   subscribeToEvents,
@@ -784,35 +786,98 @@ export const StorageService = {
     targetEventId?: string,
     operator?: User
   ): Promise<ValidationResult> {
-    // 1. Check in local cache
-    const syncRes = this.validateTicket(tokenOrNumber, targetEventId, operator);
-    if (syncRes.valid || syncRes.status === 'ALREADY_USED' || syncRes.status === 'CANCELLED' || syncRes.status === 'EVENT_MISMATCH') {
-      return syncRes;
-    }
-
-    // 2. Not found in local cache - query Cloud Firestore live
     const clean = this.normalizeScannedCode(tokenOrNumber);
+
     try {
-      const remoteTicket = await findTicketInFirestore(clean);
-      if (remoteTicket) {
-        // Cache it in local tickets
+      // 1. Authoritative check against Cloud Firestore for existence, status, and token uniqueness
+      const firestoreResult = await validateTicketWithFirestore(clean, targetEventId);
+
+      // If ticket found in Firestore, sync/update local cache
+      if (firestoreResult.ticket) {
         const tickets = getItem<Ticket[]>(STORAGE_KEYS.TICKETS, INITIAL_TICKETS);
-        const existingIdx = tickets.findIndex(t => t.id === remoteTicket.id);
-        if (existingIdx >= 0) {
-          tickets[existingIdx] = remoteTicket;
+        const idx = tickets.findIndex(t => t.id === firestoreResult.ticket!.id);
+        if (idx >= 0) {
+          tickets[idx] = firestoreResult.ticket;
         } else {
-          tickets.push(remoteTicket);
+          tickets.push(firestoreResult.ticket);
+        }
+        setItem(STORAGE_KEYS.TICKETS, tickets);
+      }
+
+      // Security audit logging
+      if (firestoreResult.status === 'ALREADY_USED' && operator && firestoreResult.ticket) {
+        this.addAuditLog(
+          firestoreResult.ticket.companyId,
+          operator.id,
+          operator.name,
+          operator.role,
+          'Tentativa Ingresso Duplicado (Firestore)',
+          `ALERTA DE FRAUDE: Tentativa de reuso do ingresso ${firestoreResult.ticket.ticketNumber} (${firestoreResult.ticket.customerName}). Primeiro check-in foi às ${firestoreResult.firstUsedAt ? new Date(firestoreResult.firstUsedAt).toLocaleTimeString('pt-BR') : 'horário registrado'}.`
+        );
+      } else if (firestoreResult.status === 'NON_UNIQUE' && operator) {
+        this.addAuditLog(
+          'comp-1',
+          operator.id,
+          operator.name,
+          operator.role,
+          'Alerta Unicidade de Token',
+          `ALERTA CRÍTICO: Token não é único no Firestore para o código ${clean}. Risco de clonagem.`
+        );
+      }
+
+      return firestoreResult;
+    } catch (err) {
+      console.warn('Firestore live validation failed, using local cache fallback:', err);
+      // Fallback to local storage validation if Firestore network request fails
+      const localResult = this.validateTicket(clean, targetEventId, operator);
+      return {
+        ...localResult,
+        source: 'LOCAL',
+        tokenUnique: localResult.valid,
+        scannedCode: clean
+      };
+    }
+  },
+
+  async confirmCheckInAsync(
+    ticketId: string,
+    operator: User
+  ): Promise<{ success: boolean; ticket?: Ticket; error?: string }> {
+    try {
+      // Execute atomic transaction directly in Cloud Firestore
+      const firestoreResult = await confirmCheckInWithFirestore(ticketId, operator);
+
+      if (firestoreResult.success && firestoreResult.ticket) {
+        // Update local state cache with the updated ticket
+        const tickets = getItem<Ticket[]>(STORAGE_KEYS.TICKETS, INITIAL_TICKETS);
+        const idx = tickets.findIndex(t => t.id === ticketId);
+        if (idx >= 0) {
+          tickets[idx] = firestoreResult.ticket;
+        } else {
+          tickets.push(firestoreResult.ticket);
         }
         setItem(STORAGE_KEYS.TICKETS, tickets);
 
-        // Re-validate with the freshly fetched remote ticket
-        return this.validateTicket(clean, targetEventId, operator);
+        // Audit log
+        this.addAuditLog(
+          firestoreResult.ticket.companyId,
+          operator.id,
+          operator.name,
+          operator.role,
+          'Check-in Confirmado (Firestore)',
+          `Entrada autorizada com sucesso via transação Firestore para ${firestoreResult.ticket.customerName} (${firestoreResult.ticket.ticketNumber} - ${firestoreResult.ticket.ticketTypeName})`
+        );
+
+        return firestoreResult;
+      } else if (!firestoreResult.success) {
+        return firestoreResult;
       }
     } catch (e) {
-      console.warn('Live Firestore ticket lookup error:', e);
+      console.warn('Firestore check-in transaction error, using local fallback:', e);
     }
 
-    return syncRes;
+    // Fallback if Firestore was unreachable
+    return this.confirmCheckIn(ticketId, operator);
   },
 
   confirmCheckIn(ticketId: string, operator: User): { success: boolean; ticket?: Ticket; error?: string } {

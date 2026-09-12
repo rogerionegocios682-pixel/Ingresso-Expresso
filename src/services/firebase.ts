@@ -9,10 +9,11 @@ import {
   updateDoc,
   getDocs,
   query,
-  where
+  where,
+  runTransaction
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
-import { Ticket, Sale, Event, TicketBatch } from '../types';
+import { Ticket, Sale, Event, TicketBatch, ValidationResult, User } from '../types';
 
 const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 
@@ -120,6 +121,206 @@ export async function findTicketInFirestore(cleanCode: string): Promise<Ticket |
   } catch (error) {
     console.error('Error querying ticket in Firestore:', error);
     return null;
+  }
+}
+
+// Live Firestore QR Code validation checking Existence, Status, and Token Uniqueness
+export async function validateTicketWithFirestore(
+  cleanCode: string,
+  targetEventId?: string
+): Promise<ValidationResult> {
+  const normalized = cleanCode.trim().toUpperCase().replace(/[\u2010-\u2015\u2212]/g, '-');
+  const checkedAt = new Date().toISOString();
+
+  try {
+    const colRef = collection(db, 'tickets');
+
+    // 1. Query by validationToken
+    const qToken = query(colRef, where('validationToken', '==', normalized));
+    const snapToken = await getDocs(qToken);
+    let matchingDocs = snapToken.docs;
+
+    // 2. Query by ticketNumber if no token match
+    if (matchingDocs.length === 0) {
+      const qNum = query(colRef, where('ticketNumber', '==', normalized));
+      const snapNum = await getDocs(qNum);
+      matchingDocs = snapNum.docs;
+    }
+
+    // 3. Query by document id as fallback
+    if (matchingDocs.length === 0) {
+      const qId = query(colRef, where('id', '==', cleanCode.trim()));
+      const snapId = await getDocs(qId);
+      matchingDocs = snapId.docs;
+    }
+
+    // 4. Verification 1: Existence
+    if (matchingDocs.length === 0) {
+      return {
+        valid: false,
+        status: 'INVALID',
+        message: 'Código de ingresso não localizado no banco de dados Firestore.',
+        tokenUnique: false,
+        checkedAt,
+        source: 'FIRESTORE',
+        scannedCode: cleanCode
+      };
+    }
+
+    // 5. Verification 2: Token Uniqueness
+    // A legitimate QR code token must match exactly 1 document in the database
+    if (matchingDocs.length > 1) {
+      return {
+        valid: false,
+        status: 'NON_UNIQUE',
+        message: `ALERTA DE SEGURANÇA: Token não é único! Foram detectados ${matchingDocs.length} ingressos com este mesmo token no banco. Possível clonagem.`,
+        tokenUnique: false,
+        checkedAt,
+        source: 'FIRESTORE',
+        scannedCode: cleanCode
+      };
+    }
+
+    const ticket = matchingDocs[0].data() as Ticket;
+
+    // Fetch associated event details from Firestore if available
+    let event: Event | undefined;
+    try {
+      const eventsSnap = await getDocs(query(collection(db, 'events'), where('id', '==', ticket.eventId)));
+      if (!eventsSnap.empty) {
+        event = eventsSnap.docs[0].data() as Event;
+      }
+    } catch {
+      // ignore
+    }
+
+    // 6. Verification 3: Event Matching
+    if (targetEventId && targetEventId !== 'all' && targetEventId !== '' && ticket.eventId !== targetEventId) {
+      return {
+        valid: false,
+        status: 'EVENT_MISMATCH',
+        message: `Este ingresso pertence ao evento "${event?.name || ticket.eventName || 'outro evento'}" e não ao evento selecionado na portaria.`,
+        ticket,
+        event,
+        tokenUnique: true,
+        checkedAt,
+        source: 'FIRESTORE',
+        scannedCode: cleanCode
+      };
+    }
+
+    // 7. Verification 4: Status (used, cancelled, blocked)
+    if (ticket.status === 'cancelled') {
+      return {
+        valid: false,
+        status: 'CANCELLED',
+        message: `Ingresso cancelado no sistema. ${ticket.notes || ticket.cancelReason ? `Motivo: ${ticket.notes || ticket.cancelReason}` : ''}`,
+        ticket,
+        event,
+        tokenUnique: true,
+        checkedAt,
+        source: 'FIRESTORE',
+        scannedCode: cleanCode
+      };
+    }
+
+    if (ticket.status === 'blocked') {
+      return {
+        valid: false,
+        status: 'BLOCKED',
+        message: 'Ingresso bloqueado preventivamente pela administração.',
+        ticket,
+        event,
+        tokenUnique: true,
+        checkedAt,
+        source: 'FIRESTORE',
+        scannedCode: cleanCode
+      };
+    }
+
+    if (ticket.status === 'used') {
+      return {
+        valid: false,
+        status: 'ALREADY_USED',
+        message: 'Atenção: Este ingresso JÁ FOI UTILIZADO e teve entrada liberada anteriormente.',
+        ticket,
+        event,
+        firstUsedAt: ticket.usedAt,
+        firstUsedByName: ticket.usedByUserName,
+        tokenUnique: true,
+        checkedAt,
+        source: 'FIRESTORE',
+        scannedCode: cleanCode
+      };
+    }
+
+    // Success: Valid, unique and confirmed
+    return {
+      valid: true,
+      status: 'VALID',
+      message: 'Ingresso válido, único e autenticado com sucesso no Firestore.',
+      ticket,
+      event,
+      tokenUnique: true,
+      checkedAt,
+      source: 'FIRESTORE',
+      scannedCode: cleanCode
+    };
+  } catch (error) {
+    console.error('Error validating ticket with Firestore:', error);
+    throw error;
+  }
+}
+
+// Atomic Check-In execution in Firestore using transactions
+export async function confirmCheckInWithFirestore(
+  ticketId: string,
+  operator: User
+): Promise<{ success: boolean; ticket?: Ticket; error?: string }> {
+  try {
+    const result = await runTransaction(db, async (transaction) => {
+      const ticketRef = doc(db, 'tickets', ticketId);
+      const ticketDoc = await transaction.get(ticketRef);
+
+      if (!ticketDoc.exists()) {
+        return { success: false, error: 'Ingresso não encontrado no Firestore.' };
+      }
+
+      const currentTicket = ticketDoc.data() as Ticket;
+
+      // Ensure ticket has not been used concurrently
+      if (currentTicket.status === 'used') {
+        return {
+          success: false,
+          error: `Ingresso já utilizado anteriormente às ${currentTicket.usedAt ? new Date(currentTicket.usedAt).toLocaleTimeString('pt-BR') : 'horário anterior'}.`
+        };
+      }
+
+      if (currentTicket.status === 'cancelled') {
+        return { success: false, error: 'Ingresso está cancelado.' };
+      }
+
+      const nowIso = new Date().toISOString();
+      const updates = {
+        status: 'used' as const,
+        usedAt: nowIso,
+        usedByUserId: operator.id,
+        usedByUserName: operator.name
+      };
+
+      transaction.update(ticketRef, updates);
+
+      return {
+        success: true,
+        ticket: { ...currentTicket, ...updates }
+      };
+    });
+
+    return result;
+  } catch (error: unknown) {
+    console.error('Firestore transaction failed:', error);
+    const err = error as Error;
+    return { success: false, error: err.message || 'Falha ao confirmar check-in no Firestore.' };
   }
 }
 
