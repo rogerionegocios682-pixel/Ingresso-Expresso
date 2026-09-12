@@ -24,6 +24,7 @@ interface TicketDisplayModalProps {
   event: Event;
   onClose: () => void;
   onNewSale: () => void;
+  onPrintSuccess?: (info: { ticketLabel: string; count: number; timestamp: string; eventName: string }) => void;
 }
 
 interface PrintNotification {
@@ -37,7 +38,8 @@ export const TicketDisplayModal: React.FC<TicketDisplayModalProps> = ({
   tickets,
   event,
   onClose,
-  onNewSale
+  onNewSale,
+  onPrintSuccess
 }) => {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [qrMap, setQrMap] = useState<Record<string, string>>({});
@@ -100,6 +102,14 @@ export const TicketDisplayModal: React.FC<TicketDisplayModalProps> = ({
     });
     setHasPrinted(true);
     setShowPrintConfirmDialog(false);
+
+    // Notify POSView operator interface
+    onPrintSuccess?.({
+      ticketLabel: label,
+      count: all ? tickets.length : 1,
+      timestamp: timeStr,
+      eventName: event.name
+    });
 
     // Auto-dismiss toast after 7 seconds
     if (toastTimeoutRef.current) {

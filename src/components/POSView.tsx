@@ -20,6 +20,7 @@ import { Event, TicketBatch, PaymentMethod, User, Ticket } from '../types';
 import { StorageService } from '../services/storage';
 import { formatCurrency, formatDate } from '../services/whatsapp';
 import { TicketDisplayModal } from './TicketDisplayModal';
+import { PrintToast, PrintToastData } from './PrintToast';
 
 interface POSViewProps {
   currentUser: User;
@@ -53,6 +54,35 @@ export const POSView: React.FC<POSViewProps> = ({ currentUser }) => {
 
   // Generated tickets state for modal display
   const [generatedTickets, setGeneratedTickets] = useState<Ticket[] | null>(null);
+
+  // Custom toast notification state for printing confirmation
+  const [printToast, setPrintToast] = useState<PrintToastData | null>(null);
+  const [lastPrintJob, setLastPrintJob] = useState<PrintToastData | null>(null);
+
+  const handlePrintSuccess = (info: {
+    ticketLabel: string;
+    count: number;
+    timestamp: string;
+    eventName: string;
+  }) => {
+    const data: PrintToastData = {
+      id: `${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+      ticketLabel: info.ticketLabel,
+      eventName: info.eventName,
+      count: info.count,
+      timestamp: info.timestamp
+    };
+    setPrintToast(data);
+    setLastPrintJob(data);
+  };
+
+  const handleReprintFromToast = () => {
+    try {
+      window.print();
+    } catch (err) {
+      console.error('Erro ao acionar reimpressão:', err);
+    }
+  };
 
   const currentEvent = useMemo(() => {
     return allEvents.find(e => e.id === selectedEventId);
@@ -156,7 +186,14 @@ export const POSView: React.FC<POSViewProps> = ({ currentUser }) => {
   ];
 
   return (
-    <div className="max-w-6xl mx-auto space-y-6">
+    <div className="max-w-6xl mx-auto space-y-6 relative">
+      {/* Custom Toast Notification confirming printing service */}
+      <PrintToast
+        toast={printToast}
+        onClose={() => setPrintToast(null)}
+        onReprint={handleReprintFromToast}
+      />
+
       {/* Top Banner / Title */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white p-5 rounded-2xl border border-slate-200/80 shadow-xs">
         <div>
@@ -171,16 +208,39 @@ export const POSView: React.FC<POSViewProps> = ({ currentUser }) => {
           </div>
         </div>
 
-        {currentUser.role === 'SELLER' && (
-          <div className="flex items-center gap-2.5 px-3.5 py-2 rounded-xl bg-indigo-50/70 border border-indigo-100 text-indigo-900 text-xs font-medium">
-            <span>Operador: <strong>{currentUser.name}</strong></span>
-            {currentUser.commissionRate ? (
-              <span className="bg-indigo-600 text-white px-2 py-0.5 rounded-full font-semibold">
-                Comissão: {currentUser.commissionRate}%
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Quick Print Status Indicator in header for fast-paced queue operations */}
+          {lastPrintJob && (
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs font-medium no-print">
+              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+              <span>
+                Última impressão: <strong>{lastPrintJob.ticketLabel}</strong> ({lastPrintJob.timestamp})
               </span>
-            ) : null}
-          </div>
-        )}
+              <button
+                type="button"
+                onClick={() => {
+                  setPrintToast(lastPrintJob);
+                  handleReprintFromToast();
+                }}
+                className="text-emerald-700 hover:text-emerald-950 font-bold underline cursor-pointer ml-1"
+                title="Reenviar comando de impressão"
+              >
+                Reimprimir
+              </button>
+            </div>
+          )}
+
+          {currentUser.role === 'SELLER' && (
+            <div className="flex items-center gap-2.5 px-3.5 py-2 rounded-xl bg-indigo-50/70 border border-indigo-100 text-indigo-900 text-xs font-medium">
+              <span>Operador: <strong>{currentUser.name}</strong></span>
+              {currentUser.commissionRate ? (
+                <span className="bg-indigo-600 text-white px-2 py-0.5 rounded-full font-semibold">
+                  Comissão: {currentUser.commissionRate}%
+                </span>
+              ) : null}
+            </div>
+          )}
+        </div>
       </div>
 
       {errorMessage && (
@@ -530,6 +590,7 @@ export const POSView: React.FC<POSViewProps> = ({ currentUser }) => {
           event={currentEvent}
           onClose={() => setGeneratedTickets(null)}
           onNewSale={handleResetForNewSale}
+          onPrintSuccess={handlePrintSuccess}
         />
       )}
     </div>
