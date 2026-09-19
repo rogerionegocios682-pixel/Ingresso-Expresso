@@ -471,9 +471,20 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 py-4 text-sm">
                   <div>
-                    <span className="text-xs text-slate-500 font-medium">Cliente:</span>
-                    <p className="font-bold text-slate-900 text-base">{validationResult.ticket?.customerName}</p>
-                    <p className="text-xs text-slate-500">{validationResult.ticket?.customerPhone}</p>
+                    <span className="text-xs text-slate-500 font-medium">Cliente / Portador:</span>
+                    <div className="flex items-center gap-2">
+                      <p className="font-bold text-slate-900 text-base">
+                        {validationResult.ticket?.customerName || 'Portador (Ingresso Físico)'}
+                      </p>
+                      {validationResult.ticket?.isBatchGenerated && (
+                        <span className="px-2 py-0.5 rounded-md bg-indigo-100 text-indigo-800 text-[10px] font-black uppercase tracking-wider">
+                          Físico (9x5 cm)
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-xs text-slate-500">
+                      {validationResult.ticket?.customerPhone || 'Emissão Física em Lote'}
+                    </p>
                   </div>
 
                   <div>

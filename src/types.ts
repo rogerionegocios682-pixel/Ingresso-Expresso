@@ -65,14 +65,22 @@ export interface TicketBatch {
   id: string;
   companyId: string;
   eventId: string;
+  batchCode?: string; // e.g. "LOT-2026-000001" or "L01"
   name: string; // e.g. "1º Lote", "Lote Promocional"
   ticketTypeName: string; // e.g. "VIP", "Pista", "Camarote", "Cortesia"
   price: number;
   totalQuantity: number;
   soldQuantity: number;
+  generatedQuantity?: number; // Number of physical/individual tickets generated for printing
+  startNumber?: number;
+  endNumber?: number;
   startDate: string;
   endDate: string;
   status: BatchStatus;
+  notes?: string;
+  artworkUrl?: string; // Event artwork applied to batch
+  createdById?: string;
+  createdByName?: string;
   createdAt: string;
 }
 
@@ -82,10 +90,12 @@ export interface Ticket {
   id: string;
   companyId: string;
   eventId: string;
+  eventName?: string;
   batchId: string;
+  batchCode?: string;
   ticketTypeName: string;
   batchName: string;
-  ticketNumber: string; // e.g. "EVT-2026-000123"
+  ticketNumber: string; // e.g. "EVT26-L01-000001"
   validationToken: string; // Unique anti-fraud token e.g. "TKT-8F72A9C4-2026-XXXX"
   customerName: string;
   customerPhone: string;
@@ -105,6 +115,7 @@ export interface Ticket {
   cancelReason?: string;
   cancelledByUserName?: string;
   notes?: string;
+  isBatchGenerated?: boolean; // True when issued as physical batch ticket for print
 }
 
 export type PaymentMethod = 'dinheiro' | 'pix' | 'debito' | 'credito' | 'cortesia' | 'outros';

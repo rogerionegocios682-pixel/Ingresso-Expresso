@@ -33,8 +33,14 @@ import {
   subscribeToTickets,
   subscribeToSales,
   subscribeToEvents,
+  subscribeToBatches,
   testFirestoreConnection
 } from './firebase';
+import {
+  exportSingleTicketToPDF,
+  exportTicketsBatchToPDF,
+  generateTicketsPDFBlob
+} from './ticketPdf';
 
 const STORAGE_KEYS = {
   COMPANIES: 'ie_companies',
@@ -51,6 +57,42 @@ const STORAGE_KEYS = {
 
 type Listener = () => void;
 const listeners: Set<Listener> = new Set();
+
+export interface SaleNotificationEvent {
+  sale: Sale;
+  tickets: Ticket[];
+  customerName: string;
+  eventName: string;
+  ticketCount: number;
+  totalAmount: number;
+}
+type SaleNotificationCallback = (event: SaleNotificationEvent) => void;
+const saleNotificationListeners: Set<SaleNotificationCallback> = new Set();
+
+export function onTicketSold(cb: SaleNotificationCallback): () => void {
+  saleNotificationListeners.add(cb);
+  return () => {
+    saleNotificationListeners.delete(cb);
+  };
+}
+
+export function notifyTicketSold(sale: Sale, tickets: Ticket[], eventName: string): void {
+  const payload: SaleNotificationEvent = {
+    sale,
+    tickets,
+    customerName: sale.customerName,
+    eventName,
+    ticketCount: tickets.length,
+    totalAmount: sale.totalAmount
+  };
+  saleNotificationListeners.forEach(cb => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error('Error notifying sale listener:', err);
+    }
+  });
+}
 
 let firestoreSyncStarted = false;
 
@@ -107,7 +149,43 @@ export function initFirestoreSync() {
     setItem(STORAGE_KEYS.SALES, merged);
   });
 
-  // 3. Seed initial default tickets to cloud if needed
+  // 3. Real-time subscription to cloud events
+  subscribeToEvents((remoteEvents) => {
+    if (!remoteEvents || remoteEvents.length === 0) return;
+    const localEvents = getItem<Event[]>(STORAGE_KEYS.EVENTS, INITIAL_EVENTS);
+    const remoteMap = new Map<string, Event>();
+    remoteEvents.forEach(e => remoteMap.set(e.id, e));
+
+    localEvents.forEach(le => {
+      if (!remoteMap.has(le.id)) {
+        remoteMap.set(le.id, le);
+        saveEventToFirestore(le);
+      }
+    });
+
+    const merged = Array.from(remoteMap.values());
+    setItem(STORAGE_KEYS.EVENTS, merged);
+  });
+
+  // 4. Real-time subscription to cloud batches
+  subscribeToBatches((remoteBatches) => {
+    if (!remoteBatches || remoteBatches.length === 0) return;
+    const localBatches = getItem<TicketBatch[]>(STORAGE_KEYS.BATCHES, INITIAL_BATCHES);
+    const remoteMap = new Map<string, TicketBatch>();
+    remoteBatches.forEach(b => remoteMap.set(b.id, b));
+
+    localBatches.forEach(lb => {
+      if (!remoteMap.has(lb.id)) {
+        remoteMap.set(lb.id, lb);
+        saveBatchToFirestore(lb);
+      }
+    });
+
+    const merged = Array.from(remoteMap.values());
+    setItem(STORAGE_KEYS.BATCHES, merged);
+  });
+
+  // 5. Seed initial default tickets to cloud if needed
   const initialLocalTickets = getItem<Ticket[]>(STORAGE_KEYS.TICKETS, INITIAL_TICKETS);
   saveTicketsBatchToFirestore(initialLocalTickets);
 }
@@ -356,16 +434,47 @@ export const StorageService = {
     return batches;
   },
 
-  saveBatch(batchData: Omit<TicketBatch, 'id' | 'createdAt' | 'soldQuantity'>): TicketBatch {
+  getBatchById(id: string): TicketBatch | undefined {
+    return getItem<TicketBatch[]>(STORAGE_KEYS.BATCHES, INITIAL_BATCHES).find(b => b.id === id);
+  },
+
+  saveBatch(
+    batchData: Omit<TicketBatch, 'id' | 'createdAt' | 'soldQuantity'>,
+    operator?: User
+  ): TicketBatch {
     const batches = getItem<TicketBatch[]>(STORAGE_KEYS.BATCHES, INITIAL_BATCHES);
+    const event = this.getEventById(batchData.eventId);
+
+    const year = new Date().getFullYear();
+    const existingForEvent = batches.filter(b => b.eventId === batchData.eventId);
+    const seq = (existingForEvent.length + 1).toString().padStart(2, '0');
+    const defaultBatchCode = `L${seq}`;
+
     const newBatch: TicketBatch = {
       ...batchData,
       id: `batch-${Date.now()}`,
+      batchCode: batchData.batchCode || defaultBatchCode,
       soldQuantity: 0,
+      generatedQuantity: 0,
+      artworkUrl: batchData.artworkUrl || event?.coverImage,
+      createdById: operator?.id || batchData.createdById,
+      createdByName: operator?.name || batchData.createdByName,
       createdAt: new Date().toISOString()
     };
     batches.push(newBatch);
     setItem(STORAGE_KEYS.BATCHES, batches);
+    saveBatchToFirestore(newBatch);
+
+    const activeUser = operator || this.getCurrentUser();
+    this.addAuditLog(
+      newBatch.companyId,
+      activeUser.id,
+      activeUser.name,
+      activeUser.role,
+      'Criação de Lote',
+      `Lote "${newBatch.name}" (${newBatch.ticketTypeName}) cadastrado para o evento "${event?.name || newBatch.eventId}". Quantidade: ${newBatch.totalQuantity} un.`
+    );
+
     return newBatch;
   },
 
@@ -375,7 +484,116 @@ export const StorageService = {
     if (idx === -1) return null;
     batches[idx] = { ...batches[idx], ...updates };
     setItem(STORAGE_KEYS.BATCHES, batches);
+    saveBatchToFirestore(batches[idx]);
     return batches[idx];
+  },
+
+  /**
+   * Generates individual tickets in bulk for printing or emission.
+   * Creates individual database records with unique structured numbers and cryptographically secure tokens.
+   */
+  async generateBatchTickets(params: {
+    batchId: string;
+    quantity: number;
+    operator: User;
+    customerName?: string;
+  }): Promise<{ success: boolean; tickets: Ticket[]; count: number; error?: string }> {
+    const batches = getItem<TicketBatch[]>(STORAGE_KEYS.BATCHES, INITIAL_BATCHES);
+    const batch = batches.find(b => b.id === params.batchId);
+    if (!batch) {
+      return { success: false, tickets: [], count: 0, error: 'Lote não encontrado.' };
+    }
+
+    // Enforce multi-company isolation
+    if (params.operator.role !== 'MASTER' && batch.companyId !== params.operator.companyId) {
+      return { success: false, tickets: [], count: 0, error: 'Acesso negado: lote de outra empresa.' };
+    }
+
+    const event = this.getEventById(batch.eventId);
+    if (!event) {
+      return { success: false, tickets: [], count: 0, error: 'Evento vinculado ao lote não encontrado.' };
+    }
+
+    const allTickets = getItem<Ticket[]>(STORAGE_KEYS.TICKETS, INITIAL_TICKETS);
+
+    // Event & Batch code formatting
+    // Pattern: EVT{YearShort}-{BatchCode}-{SequentialNumber} (e.g. EVT26-L01-000001)
+    const yearShort = (event.date ? event.date.slice(2, 4) : new Date().getFullYear().toString().slice(2, 4));
+    const batchCodeClean = (batch.batchCode || 'L01').replace(/[^a-zA-Z0-9]/g, '').slice(-3).toUpperCase();
+
+    const startSeq = (batch.generatedQuantity || 0) + 1;
+    const newTickets: Ticket[] = [];
+
+    for (let i = 0; i < params.quantity; i++) {
+      const currentSeq = startSeq + i;
+      const seqFormatted = currentSeq.toString().padStart(6, '0');
+      const ticketNumber = `EVT${yearShort}-${batchCodeClean}-${seqFormatted}`;
+
+      // Cryptographically secure 128-bit random token
+      const randomBytes = new Uint8Array(16);
+      crypto.getRandomValues(randomBytes);
+      const hexEntropy = Array.from(randomBytes).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join('');
+      const validationToken = `TKT-${hexEntropy}-${yearShort}-${seqFormatted}`;
+
+      const ticketId = `tkt-phys-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 6)}`;
+
+      const newTicket: Ticket = {
+        id: ticketId,
+        companyId: batch.companyId,
+        eventId: batch.eventId,
+        eventName: event.name,
+        batchId: batch.id,
+        batchCode: batch.batchCode || batchCodeClean,
+        ticketTypeName: batch.ticketTypeName,
+        batchName: batch.name,
+        ticketNumber,
+        validationToken,
+        customerName: params.customerName || 'Ingresso ao Portador',
+        customerPhone: '-',
+        price: batch.price,
+        paymentMethod: 'dinheiro',
+        saleId: `emission-${batch.id}`,
+        sellerId: params.operator.id,
+        sellerName: params.operator.name,
+        status: 'valid',
+        purchaseDate: new Date().toISOString(),
+        isBatchGenerated: true
+      };
+
+      newTickets.push(newTicket);
+    }
+
+    // Update batch generated counts
+    batch.generatedQuantity = (batch.generatedQuantity || 0) + params.quantity;
+    if (!batch.startNumber) batch.startNumber = startSeq;
+    batch.endNumber = (batch.generatedQuantity || 0);
+    setItem(STORAGE_KEYS.BATCHES, batches);
+    saveBatchToFirestore(batch);
+
+    // Save to LocalStorage cache
+    allTickets.push(...newTickets);
+    setItem(STORAGE_KEYS.TICKETS, allTickets);
+
+    // Persist to Cloud Firestore in bulk
+    await saveTicketsBatchToFirestore(newTickets);
+
+    // Audit Log
+    this.addAuditLog(
+      batch.companyId,
+      params.operator.id,
+      params.operator.name,
+      params.operator.role,
+      'Geração de Ingressos em Lote',
+      `Gerados ${params.quantity} ingressos individuais para impressão no lote "${batch.name}" (${batch.ticketTypeName}) do evento "${event.name}". Faixa: ${newTickets[0]?.ticketNumber} a ${newTickets[newTickets.length - 1]?.ticketNumber}.`
+    );
+
+    notifyListeners();
+
+    return {
+      success: true,
+      tickets: newTickets,
+      count: newTickets.length
+    };
   },
 
   // Tickets
@@ -431,6 +649,52 @@ export const StorageService = {
     );
 
     return tickets[idx];
+  },
+
+  // Ticket PDF Generation (Exact 9cm x 5cm layout)
+  async exportTicketPDF(ticketId: string): Promise<void> {
+    const ticket = this.getTicketById(ticketId);
+    if (!ticket) throw new Error('Ingresso não encontrado');
+    const event = this.getEventById(ticket.eventId);
+    if (!event) throw new Error('Evento vinculado não encontrado');
+    const batch = this.getBatchById(ticket.batchId);
+    await exportSingleTicketToPDF(ticket, event, batch);
+  },
+
+  async exportTicketsPDF(
+    ticketIds: string[],
+    onProgress?: (current: number, total: number) => void
+  ): Promise<void> {
+    const tickets = ticketIds
+      .map(id => this.getTicketById(id))
+      .filter((t): t is Ticket => Boolean(t));
+    if (tickets.length === 0) throw new Error('Nenhum ingresso válido selecionado');
+    const event = this.getEventById(tickets[0].eventId);
+    if (!event) throw new Error('Evento vinculado não encontrado');
+    const batch = this.getBatchById(tickets[0].batchId);
+    await exportTicketsBatchToPDF(tickets, event, batch, onProgress);
+  },
+
+  async exportBatchTicketsPDF(
+    batchId: string,
+    onProgress?: (current: number, total: number) => void
+  ): Promise<void> {
+    const batch = this.getBatchById(batchId);
+    if (!batch) throw new Error('Lote não encontrado');
+    const event = this.getEventById(batch.eventId);
+    if (!event) throw new Error('Evento vinculado não encontrado');
+    const tickets = this.getTickets(undefined, batch.eventId).filter(t => t.batchId === batch.id);
+    if (tickets.length === 0) throw new Error('Nenhum ingresso gerado para este lote');
+    await exportTicketsBatchToPDF(tickets, event, batch, onProgress);
+  },
+
+  async generateTicketPDFBlob(ticketId: string): Promise<Blob> {
+    const ticket = this.getTicketById(ticketId);
+    if (!ticket) throw new Error('Ingresso não encontrado');
+    const event = this.getEventById(ticket.eventId);
+    if (!event) throw new Error('Evento vinculado não encontrado');
+    const batch = this.getBatchById(ticket.batchId);
+    return await generateTicketsPDFBlob([ticket], event, batch);
   },
 
   // Sales
@@ -586,6 +850,9 @@ export const StorageService = {
       'Venda de Ingresso',
       `Venda ${saleNumber} realizada: ${params.quantity}x ${batch.ticketTypeName} para ${params.customerName} (${params.paymentMethod.toUpperCase()}) - Total: R$ ${totalAmount.toFixed(2)}`
     );
+
+    // Notify real-time toast listeners
+    notifyTicketSold(newSale, generatedTickets, event?.name || 'Evento');
 
     return { sale: newSale, tickets: generatedTickets };
   },
@@ -789,8 +1056,9 @@ export const StorageService = {
     const clean = this.normalizeScannedCode(tokenOrNumber);
 
     try {
-      // 1. Authoritative check against Cloud Firestore for existence, status, and token uniqueness
-      const firestoreResult = await validateTicketWithFirestore(clean, targetEventId);
+      // 1. Authoritative check against Cloud Firestore for existence, status, token uniqueness, and company isolation
+      const operatorCompanyId = operator?.role === 'MASTER' ? undefined : operator?.companyId;
+      const firestoreResult = await validateTicketWithFirestore(clean, targetEventId, operatorCompanyId);
 
       // If ticket found in Firestore, sync/update local cache
       if (firestoreResult.ticket) {

@@ -10,7 +10,8 @@ import {
   getDocs,
   query,
   where,
-  runTransaction
+  runTransaction,
+  writeBatch
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
 import { Ticket, Sale, Event, TicketBatch, ValidationResult, User } from '../types';
@@ -47,12 +48,29 @@ export async function saveTicketToFirestore(ticket: Ticket): Promise<void> {
 }
 
 export async function saveTicketsBatchToFirestore(tickets: Ticket[]): Promise<void> {
+  if (!tickets || tickets.length === 0) return;
   try {
-    for (const ticket of tickets) {
-      await setDoc(doc(db, 'tickets', ticket.id), ticket, { merge: true });
+    // Firestore batch limit is 500 ops. We use chunks of 400 for safety.
+    const chunkSize = 400;
+    for (let i = 0; i < tickets.length; i += chunkSize) {
+      const chunk = tickets.slice(i, i + chunkSize);
+      const batch = writeBatch(db);
+      for (const ticket of chunk) {
+        const ref = doc(db, 'tickets', ticket.id);
+        batch.set(ref, ticket, { merge: true });
+      }
+      await batch.commit();
     }
   } catch (error) {
     console.error('Error saving tickets batch to Firestore:', error);
+    // Fallback to individual writes if batch fails
+    for (const ticket of tickets) {
+      try {
+        await setDoc(doc(db, 'tickets', ticket.id), ticket, { merge: true });
+      } catch (err) {
+        console.error('Individual ticket save error:', err);
+      }
+    }
   }
 }
 
@@ -124,10 +142,11 @@ export async function findTicketInFirestore(cleanCode: string): Promise<Ticket |
   }
 }
 
-// Live Firestore QR Code validation checking Existence, Status, and Token Uniqueness
+// Live Firestore QR Code validation checking Existence, Status, Token Uniqueness, and Multi-company
 export async function validateTicketWithFirestore(
   cleanCode: string,
-  targetEventId?: string
+  targetEventId?: string,
+  operatorCompanyId?: string
 ): Promise<ValidationResult> {
   const normalized = cleanCode.trim().toUpperCase().replace(/[\u2010-\u2015\u2212]/g, '-');
   const checkedAt = new Date().toISOString();
@@ -173,7 +192,7 @@ export async function validateTicketWithFirestore(
       return {
         valid: false,
         status: 'NON_UNIQUE',
-        message: `ALERTA DE SEGURANÇA: Token não é único! Foram detectados ${matchingDocs.length} ingressos com este mesmo token no banco. Possível clonagem.`,
+        message: `ALERTA DE SEGURANÇA: Token não é único! Foram detectados ${matchingDocs.length} ingressos com este mesmo token no banco. Tentativa de clonagem ou duplicação.`,
         tokenUnique: false,
         checkedAt,
         source: 'FIRESTORE',
@@ -182,6 +201,19 @@ export async function validateTicketWithFirestore(
     }
 
     const ticket = matchingDocs[0].data() as Ticket;
+
+    // Multi-company isolation check
+    if (operatorCompanyId && ticket.companyId && ticket.companyId !== operatorCompanyId) {
+      return {
+        valid: false,
+        status: 'INVALID',
+        message: 'Acesso negado: Este ingresso pertence a outra empresa/organizadora.',
+        tokenUnique: true,
+        checkedAt,
+        source: 'FIRESTORE',
+        scannedCode: cleanCode
+      };
+    }
 
     // Fetch associated event details from Firestore if available
     let event: Event | undefined;
@@ -383,3 +415,24 @@ export function subscribeToEvents(onUpdate: (events: Event[]) => void): () => vo
     }
   );
 }
+
+// Subscribe to real-time updates for batches collection
+export function subscribeToBatches(onUpdate: (batches: TicketBatch[]) => void): () => void {
+  const colRef = collection(db, 'batches');
+  return onSnapshot(
+    colRef,
+    (snapshot) => {
+      const batches: TicketBatch[] = [];
+      snapshot.forEach((d) => {
+        batches.push(d.data() as TicketBatch);
+      });
+      if (batches.length > 0) {
+        onUpdate(batches);
+      }
+    },
+    (error) => {
+      console.warn('Firestore batches subscription warning:', error);
+    }
+  );
+}
+

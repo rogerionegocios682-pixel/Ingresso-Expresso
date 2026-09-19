@@ -17,6 +17,7 @@ import { CustomersView } from './components/CustomersView';
 import { UsersView } from './components/UsersView';
 import { ReportsView } from './components/ReportsView';
 import { SettingsView } from './components/SettingsView';
+import { SaleToastNotification } from './components/SaleToastNotification';
 
 export default function App() {
   // Session / Authentication state
@@ -145,6 +146,9 @@ export default function App() {
       onSelectTab={handleSelectTab}
       onLogout={handleLogout}
     >
+      {/* Real-time PDV sales toast notification system */}
+      <SaleToastNotification />
+
       {/* If focused on a specific event, show the Event Dashboard as requested in #32 (restricted to Master and Admin) */}
       {focusedEventId && (currentUser.role === 'MASTER' || currentUser.role === 'ADMIN') ? (
         <EventDashboardView

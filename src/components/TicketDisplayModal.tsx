@@ -13,11 +13,14 @@ import {
   RotateCcw,
   Sparkles,
   Layers,
-  Info
+  Info,
+  FileDown,
+  Loader2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Event, Ticket } from '../types';
 import { formatCurrency, formatDate, generateWhatsAppMessage, openWhatsAppChat } from '../services/whatsapp';
+import { exportTicketsBatchToPDF } from '../services/ticketPdf';
 
 interface TicketDisplayModalProps {
   tickets: Ticket[];
@@ -84,6 +87,21 @@ export const TicketDisplayModal: React.FC<TicketDisplayModalProps> = ({
       }
     };
   }, []);
+
+  const [isGeneratingPdf, setIsGeneratingPdf] = useState<boolean>(false);
+
+  const handleDownloadPdf = async (all: boolean = false) => {
+    setIsGeneratingPdf(true);
+    try {
+      const listToExport = all ? tickets : [currentTicket];
+      await exportTicketsBatchToPDF(listToExport, event);
+    } catch (err) {
+      console.error('Erro ao exportar PDF do ingresso:', err);
+      alert('Não foi possível gerar o arquivo PDF do ingresso.');
+    } finally {
+      setIsGeneratingPdf(false);
+    }
+  };
 
   const handlePrint = (all: boolean = false) => {
     setPrintAll(all);
@@ -452,6 +470,26 @@ export const TicketDisplayModal: React.FC<TicketDisplayModalProps> = ({
                 <span>ENVIAR PELO WHATSAPP</span>
               </button>
             </div>
+
+            {/* Export 9cm x 5cm PDF button */}
+            <button
+              type="button"
+              disabled={isGeneratingPdf}
+              onClick={() => handleDownloadPdf(tickets.length > 1)}
+              className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-700 font-bold text-xs sm:text-sm transition-all cursor-pointer"
+            >
+              {isGeneratingPdf ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin text-indigo-600" />
+                  <span>GERANDO PDF (9x5 CM)...</span>
+                </>
+              ) : (
+                <>
+                  <FileDown className="w-4 h-4 text-indigo-600" />
+                  <span>BAIXAR INGRESSO EM PDF (PADRÃO IMPRESSÃO 9x5 CM)</span>
+                </>
+              )}
+            </button>
 
             {/* Quick action to print all tickets if bundle > 1 */}
             {tickets.length > 1 && (

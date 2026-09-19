@@ -11,7 +11,9 @@ import {
   Clock,
   XCircle,
   Download,
-  AlertCircle
+  AlertCircle,
+  FileDown,
+  Loader2
 } from 'lucide-react';
 import { Ticket, TicketStatus, User } from '../types';
 import { StorageService } from '../services/storage';
@@ -48,6 +50,19 @@ export const TicketsListView: React.FC<TicketsListViewProps> = ({ currentUser })
 
   // Ticket Modal Preview
   const [previewTicket, setPreviewTicket] = useState<Ticket | null>(null);
+  const [downloadingPdfTicketId, setDownloadingPdfTicketId] = useState<string | null>(null);
+
+  const handleDownloadTicketPdf = async (ticketId: string) => {
+    setDownloadingPdfTicketId(ticketId);
+    try {
+      await StorageService.exportTicketPDF(ticketId);
+    } catch (err) {
+      console.error('Erro ao baixar PDF do ingresso:', err);
+      alert('Não foi possível gerar o arquivo PDF do ingresso.');
+    } finally {
+      setDownloadingPdfTicketId(null);
+    }
+  };
 
   const refreshTickets = () => {
     setTickets(StorageService.getTickets(currentUser.role === 'MASTER' ? undefined : companyId));
@@ -303,6 +318,19 @@ export const TicketsListView: React.FC<TicketsListViewProps> = ({ currentUser })
                             title="Ver Ingresso / QR Code"
                           >
                             <Eye className="w-4 h-4" />
+                          </button>
+
+                          <button
+                            onClick={() => handleDownloadTicketPdf(ticket.id)}
+                            disabled={downloadingPdfTicketId === ticket.id}
+                            className="p-1.5 rounded-lg bg-slate-100 hover:bg-indigo-50 hover:text-indigo-600 text-slate-600 transition-colors disabled:opacity-50"
+                            title="Baixar Ingresso em PDF (9x5 cm)"
+                          >
+                            {downloadingPdfTicketId === ticket.id ? (
+                              <Loader2 className="w-4 h-4 animate-spin text-indigo-600" />
+                            ) : (
+                              <FileDown className="w-4 h-4" />
+                            )}
                           </button>
 
                           {event && (
