@@ -18,8 +18,64 @@ import { UsersView } from './components/UsersView';
 import { ReportsView } from './components/ReportsView';
 import { SettingsView } from './components/SettingsView';
 import { SaleToastNotification } from './components/SaleToastNotification';
+import { PublicEventPageView } from './components/PublicEventPageView';
+
+function detectPublicEventSlug(): string | null {
+  if (typeof window === 'undefined') return null;
+
+  // Check URL pathname (e.g. /evento/mega-festival-de-verao-2026 or /e/slug)
+  const path = window.location.pathname;
+  const match = path.match(/^\/(?:evento|e|event)\/([^/?#]+)/i);
+  if (match && match[1]) {
+    return decodeURIComponent(match[1]);
+  }
+
+  // Check hash (e.g. #/evento/mega-festival-de-verao-2026)
+  const hash = window.location.hash;
+  const hashMatch = hash.match(/#\/(?:evento|e|event)\/([^/?#]+)/i);
+  if (hashMatch && hashMatch[1]) {
+    return decodeURIComponent(hashMatch[1]);
+  }
+
+  // Check search query (e.g. ?evento=mega-festival-de-verao-2026)
+  const searchParams = new URLSearchParams(window.location.search);
+  const qEvento = searchParams.get('evento') || searchParams.get('event') || searchParams.get('e');
+  if (qEvento) {
+    return qEvento;
+  }
+
+  return null;
+}
 
 export default function App() {
+  // Public Event URL State (e.g., /evento/meu-evento)
+  const [publicEventSlug, setPublicEventSlug] = useState<string | null>(detectPublicEventSlug);
+
+  useEffect(() => {
+    const handleLocationChange = () => {
+      setPublicEventSlug(detectPublicEventSlug());
+    };
+    window.addEventListener('popstate', handleLocationChange);
+    return () => window.removeEventListener('popstate', handleLocationChange);
+  }, []);
+
+  const handleOpenPublicPage = (slugOrId: string) => {
+    setPublicEventSlug(slugOrId);
+    try {
+      window.history.pushState(null, '', `/evento/${slugOrId}`);
+    } catch (e) {
+      // Fallback
+    }
+  };
+
+  const handleClosePublicPage = () => {
+    setPublicEventSlug(null);
+    try {
+      window.history.pushState(null, '', '/');
+    } catch (e) {
+      // Fallback
+    }
+  };
   // Session / Authentication state
   const [currentUser, setCurrentUser] = useState<User | null>(() => {
     const saved = localStorage.getItem('ingressos_current_user');
@@ -135,6 +191,16 @@ export default function App() {
     setFocusedEventId(null);
   };
 
+  if (publicEventSlug) {
+    return (
+      <PublicEventPageView
+        slugOrId={publicEventSlug}
+        currentUser={currentUser}
+        onBackToAdmin={currentUser ? handleClosePublicPage : undefined}
+      />
+    );
+  }
+
   if (!currentUser) {
     return <LoginView onLogin={handleLogin} />;
   }
@@ -158,6 +224,7 @@ export default function App() {
           onNavigateToPOS={() => handleNavigateToPOS(focusedEventId)}
           onNavigateToCheckIn={() => handleNavigateToCheckIn(focusedEventId)}
           onNavigateToBatches={() => handleNavigateToBatches(focusedEventId)}
+          onOpenPublicPage={handleOpenPublicPage}
         />
       ) : (
         <>
@@ -183,6 +250,7 @@ export default function App() {
                   onSelectEvent={handleOpenEventDashboard}
                   onManageBatches={handleNavigateToBatches}
                   onOpenPOS={handleNavigateToPOS}
+                  onOpenPublicPage={handleOpenPublicPage}
                 />
               )}
 

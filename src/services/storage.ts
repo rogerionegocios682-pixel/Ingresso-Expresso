@@ -240,6 +240,17 @@ export function generateValidationToken(ticketNumber: string): string {
   return `TKT-${hex}-${year}-${cleanNumber || '00001'}`;
 }
 
+export function generateEventSlug(name: string, id: string): string {
+  const clean = (name || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  const idSuffix = id ? id.replace(/[^a-zA-Z0-9]/g, '').slice(-5) : Math.random().toString(36).substring(2, 7);
+  return clean ? `${clean}-${idSuffix}` : `evento-${idSuffix}`;
+}
+
 export const StorageService = {
   // Real-time store subscription
   subscribe(listener: Listener): () => void {
@@ -379,11 +390,73 @@ export const StorageService = {
     return this.getEvents().find(e => e.id === id);
   },
 
+  getEventBySlug(slugOrId: string): Event | undefined {
+    if (!slugOrId) return undefined;
+    const clean = slugOrId.trim().toLowerCase();
+    const events = this.getEvents();
+    return events.find(e => {
+      if (e.id.toLowerCase() === clean) return true;
+      if (e.slug && e.slug.toLowerCase() === clean) return true;
+      if (e.name) {
+        const auto = generateEventSlug(e.name, e.id).toLowerCase();
+        if (auto === clean) return true;
+        const simple = e.name
+          .toLowerCase()
+          .normalize('NFD')
+          .replace(/[\u0300-\u036f]/g, '')
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '');
+        if (simple === clean) return true;
+      }
+      return false;
+    });
+  },
+
+  getPublicEventUrl(event: Event): string {
+    const slug = event.slug || generateEventSlug(event.name, event.id);
+    const origin = typeof window !== 'undefined' ? window.location.origin : '';
+    return `${origin}/evento/${slug}`;
+  },
+
+  getPublicEventData(slugOrId: string): {
+    event: Event;
+    company: Partial<Company>;
+    batches: TicketBatch[];
+  } | null {
+    const event = this.getEventBySlug(slugOrId);
+    if (!event) return null;
+
+    const company = this.getCompanies().find(c => c.id === event.companyId);
+    // Return only batches belonging to this specific event
+    const batches = this.getBatches(undefined, event.id);
+
+    return {
+      event,
+      company: {
+        id: company?.id || event.companyId,
+        name: company?.name || event.organizerName,
+        phone: company?.phone,
+        whatsapp: company?.whatsapp || event.whatsapp,
+        email: company?.email || event.email,
+        supportEmail: company?.supportEmail,
+        pixKey: company?.pixKey,
+        pixKeyType: company?.pixKeyType,
+        pixRecipientName: company?.pixRecipientName || company?.name,
+        bankName: company?.bankName,
+        logoUrl: company?.logoUrl
+      },
+      batches
+    };
+  },
+
   saveEvent(eventData: Omit<Event, 'id' | 'createdAt'>): Event {
     const events = getItem<Event[]>(STORAGE_KEYS.EVENTS, INITIAL_EVENTS);
+    const id = `evt-${Date.now()}`;
+    const slug = eventData.slug || generateEventSlug(eventData.name, id);
     const newEvent: Event = {
       ...eventData,
-      id: `evt-${Date.now()}`,
+      id,
+      slug,
       createdAt: new Date().toISOString()
     };
     events.unshift(newEvent);
@@ -396,7 +469,7 @@ export const StorageService = {
       currentUser.name,
       currentUser.role,
       'Criação de Evento',
-      `Criou o evento "${newEvent.name}" em ${newEvent.venue}`
+      `Criou o evento "${newEvent.name}" em ${newEvent.venue} com link público /evento/${slug}`
     );
 
     return newEvent;
@@ -406,7 +479,14 @@ export const StorageService = {
     const events = getItem<Event[]>(STORAGE_KEYS.EVENTS, INITIAL_EVENTS);
     const idx = events.findIndex(e => e.id === id);
     if (idx === -1) return null;
-    events[idx] = { ...events[idx], ...updates };
+    
+    // Ensure event has a valid slug
+    let updatedSlug = updates.slug || events[idx].slug;
+    if (!updatedSlug && (updates.name || events[idx].name)) {
+      updatedSlug = generateEventSlug(updates.name || events[idx].name, id);
+    }
+
+    events[idx] = { ...events[idx], ...updates, slug: updatedSlug };
     setItem(STORAGE_KEYS.EVENTS, events);
 
     const currentUser = this.getCurrentUser();
@@ -853,6 +933,168 @@ export const StorageService = {
 
     // Notify real-time toast listeners
     notifyTicketSold(newSale, generatedTickets, event?.name || 'Evento');
+
+    return { sale: newSale, tickets: generatedTickets };
+  },
+
+  // Public Online Event Sale (Used by customer on the public event page)
+  createPublicSale(params: {
+    eventId: string;
+    batchId: string;
+    quantity: number;
+    customerName: string;
+    customerPhone: string;
+    customerEmail?: string;
+    customerDoc?: string;
+    paymentMethod?: PaymentMethod;
+  }): { sale: Sale; tickets: Ticket[] } {
+    const event = this.getEventById(params.eventId);
+    if (!event) {
+      throw new Error('Evento não encontrado.');
+    }
+
+    if (event.status !== 'active') {
+      if (event.status === 'draft') {
+        throw new Error('Este evento ainda está em fase de planejamento e as vendas não foram abertas ao público.');
+      }
+      if (event.status === 'finished') {
+        throw new Error('Vendas encerradas para este evento.');
+      }
+      if (event.status === 'cancelled') {
+        throw new Error('Este evento foi cancelado pela organização.');
+      }
+      throw new Error('Evento indisponível para compra no momento.');
+    }
+
+    const batches = getItem<TicketBatch[]>(STORAGE_KEYS.BATCHES, INITIAL_BATCHES);
+    const batch = batches.find(b => b.id === params.batchId);
+    if (!batch || batch.eventId !== event.id) {
+      throw new Error('Lote de ingressos não localizado para este evento.');
+    }
+
+    const available = batch.totalQuantity - batch.soldQuantity;
+    if (available < params.quantity) {
+      throw new Error(`Quantidade solicitada indisponível. Restam apenas ${available} ingresso(s) neste lote.`);
+    }
+
+    if (!params.customerName || !params.customerName.trim()) {
+      throw new Error('Por favor, informe o nome completo do titular.');
+    }
+
+    if (!params.customerPhone || !params.customerPhone.trim()) {
+      throw new Error('Por favor, informe o WhatsApp ou telefone para envio dos ingressos.');
+    }
+
+    const sales = getItem<Sale[]>(STORAGE_KEYS.SALES, INITIAL_SALES);
+    const allTickets = getItem<Ticket[]>(STORAGE_KEYS.TICKETS, INITIAL_TICKETS);
+
+    // Update batch stock
+    batch.soldQuantity += params.quantity;
+    if (batch.soldQuantity >= batch.totalQuantity) {
+      batch.status = 'exhausted';
+    }
+    setItem(STORAGE_KEYS.BATCHES, batches);
+
+    const saleSeq = (sales.length + 1).toString().padStart(4, '0');
+    const saleNumber = `VND-PUB-${new Date().getFullYear()}-${saleSeq}`;
+    const saleId = `sale-pub-${Date.now()}`;
+    const unitPrice = batch.price;
+    const totalAmount = unitPrice * params.quantity;
+    const paymentMethod: PaymentMethod = params.paymentMethod || 'pix';
+
+    const generatedTickets: Ticket[] = [];
+    const ticketIds: string[] = [];
+
+    for (let i = 0; i < params.quantity; i++) {
+      const ticketSeq = (allTickets.length + i + 1).toString().padStart(6, '0');
+      const ticketNumber = `EVT-${new Date().getFullYear()}-${ticketSeq}`;
+      const token = generateValidationToken(ticketNumber);
+      const ticketId = `tkt-pub-${Date.now()}-${i}`;
+
+      const ticket: Ticket = {
+        id: ticketId,
+        companyId: event.companyId,
+        eventId: event.id,
+        eventName: event.name,
+        batchId: batch.id,
+        ticketTypeName: batch.ticketTypeName,
+        batchName: batch.name,
+        ticketNumber,
+        validationToken: token,
+        customerName: params.customerName.trim(),
+        customerPhone: params.customerPhone.trim(),
+        customerEmail: params.customerEmail?.trim(),
+        customerDoc: params.customerDoc?.trim(),
+        price: unitPrice,
+        paymentMethod,
+        saleId,
+        sellerId: 'web-online',
+        sellerName: 'Venda Online / Link do Evento',
+        status: 'valid',
+        purchaseDate: new Date().toISOString()
+      };
+
+      generatedTickets.push(ticket);
+      ticketIds.push(ticketId);
+    }
+
+    allTickets.push(...generatedTickets);
+    setItem(STORAGE_KEYS.TICKETS, allTickets);
+    saveTicketsBatchToFirestore(generatedTickets);
+
+    const newSale: Sale = {
+      id: saleId,
+      companyId: event.companyId,
+      saleNumber,
+      eventId: event.id,
+      eventName: event.name,
+      ticketIds,
+      batchId: batch.id,
+      ticketTypeName: batch.ticketTypeName,
+      batchName: batch.name,
+      quantity: params.quantity,
+      unitPrice,
+      totalAmount,
+      paymentMethod,
+      customerName: params.customerName.trim(),
+      customerPhone: params.customerPhone.trim(),
+      customerEmail: params.customerEmail?.trim(),
+      customerDoc: params.customerDoc?.trim(),
+      sellerId: 'web-online',
+      sellerName: 'Venda Online / Link do Evento',
+      sellerCommission: 0,
+      createdAt: new Date().toISOString(),
+      status: 'completed'
+    };
+
+    sales.unshift(newSale);
+    setItem(STORAGE_KEYS.SALES, sales);
+    saveSaleToFirestore(newSale);
+
+    // Register or update customer record
+    this.upsertCustomer({
+      companyId: event.companyId,
+      name: params.customerName.trim(),
+      phone: params.customerPhone.trim(),
+      whatsapp: params.customerPhone.replace(/[^0-9]/g, ''),
+      email: params.customerEmail?.trim() || '',
+      cpf: params.customerDoc?.trim(),
+      amount: totalAmount,
+      ticketCount: params.quantity
+    });
+
+    // Audit log
+    this.addAuditLog(
+      event.companyId,
+      'online-customer',
+      params.customerName.trim(),
+      'SELLER',
+      'Venda Online Link do Evento',
+      `Cliente adquiriu ${params.quantity}x ingresso(s) (${batch.ticketTypeName} - ${batch.name}) via link público do evento "${event.name}". Total: R$ ${totalAmount.toFixed(2)}`
+    );
+
+    // Notify real-time system
+    notifyTicketSold(newSale, generatedTickets, event.name);
 
     return { sale: newSale, tickets: generatedTickets };
   },

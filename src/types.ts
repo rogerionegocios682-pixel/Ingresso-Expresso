@@ -57,6 +57,9 @@ export interface Event {
   email: string;
   status: EventStatus;
   createdAt: string;
+  slug?: string;
+  bannerImage?: string;
+  attractions?: string[];
 }
 
 export type BatchStatus = 'active' | 'exhausted' | 'inactive';

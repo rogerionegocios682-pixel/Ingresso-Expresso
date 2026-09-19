@@ -115,7 +115,9 @@ export const INITIAL_EVENTS: Event[] = [
     whatsapp: '11987654321',
     email: 'contato@showefestas.com.br',
     status: 'active',
-    createdAt: '2026-02-10T10:00:00.000Z'
+    createdAt: '2026-02-10T10:00:00.000Z',
+    slug: 'mega-festival-de-musica-de-verao-2026',
+    attractions: ['Vintage Culture', 'Alok', 'Jorge & Mateus', 'Ivete Sangalo', 'Dennis DJ']
   },
   {
     id: 'evt-02',
@@ -136,7 +138,9 @@ export const INITIAL_EVENTS: Event[] = [
     whatsapp: '11987654321',
     email: 'tech@showefestas.com.br',
     status: 'active',
-    createdAt: '2026-02-15T11:00:00.000Z'
+    createdAt: '2026-02-15T11:00:00.000Z',
+    slug: 'tech-inovacao-summit-brasil-2026',
+    attractions: ['Keynote: IA Aplicada a Negócios', 'Painel: Venture Capital & Startups', 'Masterclass: Cloud & Cyber Security']
   },
   {
     id: 'evt-03',
@@ -157,7 +161,9 @@ export const INITIAL_EVENTS: Event[] = [
     whatsapp: '11987654321',
     email: 'contato@showefestas.com.br',
     status: 'active',
-    createdAt: '2026-03-01T15:00:00.000Z'
+    createdAt: '2026-03-01T15:00:00.000Z',
+    slug: 'noite-de-stand-up-comedy-especial',
+    attractions: ['Thiago Ventura', 'Bruna Louise', 'Afonso Padilha', 'Márcio Donato']
   }
 ];
 

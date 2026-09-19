@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   Calendar,
   Clock,
@@ -11,7 +11,12 @@ import {
   ShoppingCart,
   QrCode,
   Layers,
-  ArrowRight
+  ArrowRight,
+  Globe,
+  Copy,
+  Check,
+  Share2,
+  ExternalLink
 } from 'lucide-react';
 import { Event, User } from '../types';
 import { StorageService } from '../services/storage';
@@ -24,6 +29,7 @@ interface EventDashboardViewProps {
   onNavigateToPOS: () => void;
   onNavigateToCheckIn: () => void;
   onNavigateToBatches: () => void;
+  onOpenPublicPage?: (slugOrId: string) => void;
 }
 
 export const EventDashboardView: React.FC<EventDashboardViewProps> = ({
@@ -32,10 +38,12 @@ export const EventDashboardView: React.FC<EventDashboardViewProps> = ({
   onBack,
   onNavigateToPOS,
   onNavigateToCheckIn,
-  onNavigateToBatches
+  onNavigateToBatches,
+  onOpenPublicPage
 }) => {
   const event = StorageService.getEventById(eventId);
   const companyId = StorageService.getCurrentCompanyId();
+  const [copiedLink, setCopiedLink] = useState(false);
 
   if (!event) {
     return (
@@ -137,6 +145,77 @@ export const EventDashboardView: React.FC<EventDashboardViewProps> = ({
               Gerenciar Lotes
             </button>
           </div>
+        </div>
+      </div>
+
+      {/* Seção Exclusiva: LINK PÚBLICO DO EVENTO (Requisito #14) */}
+      <div className="bg-white rounded-2xl border border-indigo-200/80 p-5 shadow-xs space-y-3">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <div className="w-8 h-8 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center">
+              <Globe className="w-4 h-4" />
+            </div>
+            <div>
+              <h3 className="font-bold text-slate-900 text-sm flex items-center gap-1.5">
+                Link Público Exclusivo do Evento
+                <span className="px-2 py-0.5 rounded-md bg-emerald-100 text-emerald-700 text-[10px] font-black uppercase">
+                  Página Comercial
+                </span>
+              </h3>
+              <p className="text-xs text-slate-500">
+                Divulgue este link no WhatsApp, Instagram e redes sociais. Seus clientes compram ingressos diretamente sem acesso ao painel admin.
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 shrink-0 pt-2 sm:pt-0">
+            <button
+              type="button"
+              onClick={() => {
+                const url = StorageService.getPublicEventUrl(event);
+                navigator.clipboard.writeText(url);
+                setCopiedLink(true);
+                setTimeout(() => setCopiedLink(false), 2500);
+              }}
+              className="flex items-center gap-1.5 py-2 px-3.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs transition-colors shadow-xs cursor-pointer"
+            >
+              {copiedLink ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Copy className="w-3.5 h-3.5" />}
+              {copiedLink ? 'Link Copiado!' : 'Copiar Link'}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                const url = StorageService.getPublicEventUrl(event);
+                const text = `Ingressos disponíveis para *${event.name}*!\n\nGaranta seu ingresso pelo link oficial:\n${url}`;
+                window.open(`https://api.whatsapp.com/send?text=${encodeURIComponent(text)}`, '_blank');
+              }}
+              className="flex items-center gap-1.5 py-2 px-3 rounded-xl bg-emerald-50 hover:bg-emerald-100 text-emerald-700 font-bold text-xs transition-colors cursor-pointer border border-emerald-200"
+            >
+              <Share2 className="w-3.5 h-3.5" /> Divulgar WhatsApp
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                if (onOpenPublicPage) {
+                  onOpenPublicPage(event.slug || event.id);
+                } else {
+                  const url = StorageService.getPublicEventUrl(event);
+                  window.open(url, '_blank');
+                }
+              }}
+              className="flex items-center gap-1.5 py-2 px-3 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs transition-colors cursor-pointer"
+            >
+              <ExternalLink className="w-3.5 h-3.5" /> Abrir Página
+            </button>
+          </div>
+        </div>
+
+        {/* Display URL in Monospace Box */}
+        <div className="flex items-center gap-2 bg-slate-50 p-2.5 rounded-xl border border-slate-200 text-xs font-mono text-slate-700 select-all overflow-x-auto">
+          <span className="text-indigo-600 font-bold select-none">URL:</span>
+          <span className="truncate">{StorageService.getPublicEventUrl(event)}</span>
         </div>
       </div>
 
