@@ -12,9 +12,13 @@ import {
   Search,
   Filter,
   CheckCircle2,
-  AlertTriangle
+  AlertTriangle,
+  ShieldCheck,
+  AlertCircle,
+  Info,
+  Globe
 } from 'lucide-react';
-import { User, Event, Sale } from '../types';
+import { User, Event, Sale, AuditLog } from '../types';
 import { StorageService } from '../services/storage';
 import { formatCurrency, formatDate } from '../services/whatsapp';
 import { exportToCSV } from '../services/export';
@@ -37,12 +41,14 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ currentUser }) => {
   const allUsers = StorageService.getUsers(currentUser.role === 'MASTER' ? undefined : companyId);
 
   const [activeReportType, setActiveReportType] = useState<
-    'general' | 'sales' | 'financial' | 'checkin' | 'cancelled' | 'seller'
+    'general' | 'sales' | 'financial' | 'checkin' | 'cancelled' | 'seller' | 'audit'
   >('general');
 
   const [selectedEventId, setSelectedEventId] = useState<string>('all');
   const [selectedPayment, setSelectedPayment] = useState<string>('all');
   const [selectedSellerId, setSelectedSellerId] = useState<string>('all');
+  const [auditFilter, setAuditFilter] = useState<'all' | 'routing_error' | 'checkin' | 'other'>('all');
+  const [auditSearchQuery, setAuditSearchQuery] = useState<string>('');
 
   const sales = StorageService.getSales(
     currentUser.role === 'MASTER' ? undefined : companyId,
@@ -58,6 +64,38 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ currentUser }) => {
     currentUser.role === 'MASTER' ? undefined : companyId,
     selectedEventId === 'all' ? undefined : selectedEventId
   );
+
+  const auditLogs = StorageService.getAuditLogs(currentUser.role === 'MASTER' ? undefined : companyId);
+
+  const filteredAuditLogs = useMemo(() => {
+    return auditLogs.filter(log => {
+      // Filter by category
+      if (auditFilter === 'routing_error') {
+        if (!log.action.toLowerCase().includes('roteamento') && !log.action.toLowerCase().includes('404')) {
+          return false;
+        }
+      } else if (auditFilter === 'checkin') {
+        if (!log.action.toLowerCase().includes('check-in')) {
+          return false;
+        }
+      } else if (auditFilter === 'other') {
+        if (log.action.toLowerCase().includes('roteamento') || log.action.toLowerCase().includes('check-in')) {
+          return false;
+        }
+      }
+
+      // Filter by search query
+      if (auditSearchQuery.trim()) {
+        const q = auditSearchQuery.toLowerCase();
+        const matchesAction = log.action.toLowerCase().includes(q);
+        const matchesUser = log.userName.toLowerCase().includes(q);
+        const matchesDetails = log.details.toLowerCase().includes(q);
+        return matchesAction || matchesUser || matchesDetails;
+      }
+
+      return true;
+    });
+  }, [auditLogs, auditFilter, auditSearchQuery]);
 
   // Financial calculations
   const financialTotals = useMemo(() => {
@@ -155,6 +193,18 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ currentUser }) => {
         t.cancelledByUserName || '-'
       ]);
       exportToCSV('relatorio_cancelados', headers, rows);
+    } else if (activeReportType === 'audit') {
+      const headers = ['ID', 'Data/Hora', 'Ação', 'Usuário/Origem', 'Cargo', 'Detalhes', 'IP'];
+      const rows = filteredAuditLogs.map(l => [
+        l.id,
+        new Date(l.createdAt).toLocaleString('pt-BR'),
+        l.action,
+        l.userName,
+        l.userRole,
+        l.details,
+        l.ip || '-'
+      ]);
+      exportToCSV('relatorio_auditoria_logs', headers, rows);
     } else {
       // General
       const headers = ['Métrica', 'Valor'];
@@ -254,6 +304,15 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ currentUser }) => {
           }`}
         >
           Por Vendedor
+        </button>
+        <button
+          onClick={() => setActiveReportType('audit')}
+          className={`px-3.5 py-2 rounded-xl text-xs sm:text-sm font-bold transition-all cursor-pointer flex items-center gap-1.5 ${
+            activeReportType === 'audit' ? 'bg-indigo-600 text-white shadow-xs' : 'bg-white text-slate-600 hover:bg-slate-100'
+          }`}
+        >
+          <ShieldCheck className="w-3.5 h-3.5" />
+          Auditoria & Logs
         </button>
       </div>
 
@@ -543,6 +602,172 @@ export const ReportsView: React.FC<ReportsViewProps> = ({ currentUser }) => {
                 ))}
               </tbody>
             </table>
+          </div>
+        </div>
+      )}
+
+      {/* 7. AUDITORIA E LOGS DO SISTEMA */}
+      {activeReportType === 'audit' && (
+        <div className="space-y-6">
+          {/* Metrics summary */}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+            <div className="bg-white p-4 rounded-xl border border-slate-200/80 shadow-2xs">
+              <span className="text-xs font-semibold text-slate-500">Total de Registros de Auditoria</span>
+              <p className="text-2xl font-black text-slate-900 mt-1">{auditLogs.length}</p>
+            </div>
+            <div className="bg-white p-4 rounded-xl border border-rose-200/80 shadow-2xs">
+              <span className="text-xs font-semibold text-rose-600 flex items-center gap-1">
+                <AlertCircle className="w-3.5 h-3.5" />
+                Erros de Roteamento / Slugs 404
+              </span>
+              <p className="text-2xl font-black text-rose-700 mt-1">
+                {auditLogs.filter(l => l.action.toLowerCase().includes('roteamento') || l.action.toLowerCase().includes('404')).length}
+              </p>
+            </div>
+            <div className="bg-white p-4 rounded-xl border border-teal-200/80 shadow-2xs">
+              <span className="text-xs font-semibold text-teal-700 flex items-center gap-1">
+                <CheckCircle2 className="w-3.5 h-3.5" />
+                Check-ins & Validações
+              </span>
+              <p className="text-2xl font-black text-teal-800 mt-1">
+                {auditLogs.filter(l => l.action.toLowerCase().includes('check-in')).length}
+              </p>
+            </div>
+          </div>
+
+          {/* Audit Table Card */}
+          <div className="bg-white rounded-2xl border border-slate-200/80 shadow-xs overflow-hidden">
+            <div className="p-4 border-b border-slate-200 flex flex-col md:flex-row md:items-center justify-between gap-3">
+              <div>
+                <h3 className="font-bold text-slate-900 flex items-center gap-2">
+                  <ShieldCheck className="w-5 h-5 text-indigo-600" />
+                  Auditoria de Operações e Roteamento Público
+                </h3>
+                <p className="text-xs text-slate-500">
+                  Histórico contínuo de acessos, erros de links mal-formados/corrompidos e ações de operadores
+                </p>
+              </div>
+
+              {/* Sub-filters and Search */}
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="flex items-center gap-1 bg-slate-100 p-1 rounded-xl">
+                  <button
+                    onClick={() => setAuditFilter('all')}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all ${
+                      auditFilter === 'all' ? 'bg-white text-slate-900 shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Todos ({auditLogs.length})
+                  </button>
+                  <button
+                    onClick={() => setAuditFilter('routing_error')}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all flex items-center gap-1 ${
+                      auditFilter === 'routing_error' ? 'bg-rose-600 text-white shadow-2xs' : 'text-rose-700 hover:bg-rose-50'
+                    }`}
+                  >
+                    <AlertCircle className="w-3 h-3" />
+                    Erros de Link/404
+                  </button>
+                  <button
+                    onClick={() => setAuditFilter('checkin')}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all ${
+                      auditFilter === 'checkin' ? 'bg-teal-600 text-white shadow-2xs' : 'text-teal-700 hover:bg-teal-50'
+                    }`}
+                  >
+                    Portaria
+                  </button>
+                  <button
+                    onClick={() => setAuditFilter('other')}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all ${
+                      auditFilter === 'other' ? 'bg-slate-700 text-white shadow-2xs' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    Outros
+                  </button>
+                </div>
+
+                <div className="relative">
+                  <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    placeholder="Filtrar por slug, ação ou detalhe..."
+                    value={auditSearchQuery}
+                    onChange={e => setAuditSearchQuery(e.target.value)}
+                    className="pl-8 pr-3 py-1.5 text-xs rounded-xl border border-slate-300 bg-white focus:ring-2 focus:ring-indigo-500 w-52 sm:w-64"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-50 text-slate-500 font-bold uppercase text-[10px]">
+                  <tr>
+                    <th className="p-3">Data / Hora</th>
+                    <th className="p-3">Ação / Categoria</th>
+                    <th className="p-3">Usuário / Origem</th>
+                    <th className="p-3">Diagnóstico e Detalhes de Auditoria</th>
+                    <th className="p-3">Canal / IP</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {filteredAuditLogs.length === 0 ? (
+                    <tr>
+                      <td colSpan={5} className="p-8 text-center text-slate-400 italic">
+                        Nenhum registro de auditoria corresponde aos filtros aplicados.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredAuditLogs.map(log => {
+                      const isRoutingError =
+                        log.action.toLowerCase().includes('roteamento') ||
+                        log.action.toLowerCase().includes('404');
+                      const isCheckin = log.action.toLowerCase().includes('check-in');
+
+                      return (
+                        <tr key={log.id} className={isRoutingError ? 'bg-rose-50/30' : undefined}>
+                          <td className="p-3 text-slate-600 whitespace-nowrap">
+                            <span className="font-semibold text-slate-900 block">
+                              {new Date(log.createdAt).toLocaleDateString('pt-BR')}
+                            </span>
+                            <span className="text-[10px] text-slate-500">
+                              {new Date(log.createdAt).toLocaleTimeString('pt-BR')}
+                            </span>
+                          </td>
+                          <td className="p-3">
+                            <span
+                              className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-bold uppercase ${
+                                isRoutingError
+                                  ? 'bg-rose-100 text-rose-800 border border-rose-200'
+                                  : isCheckin
+                                  ? 'bg-teal-100 text-teal-800 border border-teal-200'
+                                  : 'bg-slate-100 text-slate-700 border border-slate-200'
+                              }`}
+                            >
+                              {isRoutingError && <AlertCircle className="w-3 h-3" />}
+                              {isCheckin && <CheckCircle2 className="w-3 h-3" />}
+                              {log.action}
+                            </span>
+                          </td>
+                          <td className="p-3">
+                            <span className="font-semibold text-slate-900 block">{log.userName}</span>
+                            <span className="text-[10px] text-slate-500 font-mono">[{log.userRole}]</span>
+                          </td>
+                          <td className="p-3 text-slate-700 max-w-xl">
+                            <div className="space-y-1">
+                              <p className="text-xs leading-relaxed break-words">{log.details}</p>
+                            </div>
+                          </td>
+                          <td className="p-3 text-slate-500 whitespace-nowrap font-mono text-[11px]">
+                            {log.ip || '127.0.0.1 (Web)'}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}

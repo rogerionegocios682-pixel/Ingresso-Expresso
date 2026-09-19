@@ -39,7 +39,9 @@ import {
 import {
   exportSingleTicketToPDF,
   exportTicketsBatchToPDF,
-  generateTicketsPDFBlob
+  exportTicketsBatchToA4PDF,
+  generateTicketsPDFBlob,
+  generateA4TicketsPDFBlob
 } from './ticketPdf';
 
 const STORAGE_KEYS = {
@@ -57,6 +59,7 @@ const STORAGE_KEYS = {
 
 type Listener = () => void;
 const listeners: Set<Listener> = new Set();
+const loggedRoutingErrors: Set<string> = new Set();
 
 export interface SaleNotificationEvent {
   sale: Sale;
@@ -392,7 +395,15 @@ export const StorageService = {
 
   getEventBySlug(slugOrId: string): Event | undefined {
     if (!slugOrId) return undefined;
-    const clean = slugOrId.trim().toLowerCase();
+    let clean = slugOrId.trim();
+    try {
+      clean = decodeURIComponent(clean);
+    } catch (e) {
+      // Keep as-is if malformed
+    }
+    clean = clean.replace(/^\/+|\/+$/g, '').toLowerCase().trim();
+    if (!clean) return undefined;
+
     const events = this.getEvents();
     return events.find(e => {
       if (e.id.toLowerCase() === clean) return true;
@@ -768,6 +779,34 @@ export const StorageService = {
     await exportTicketsBatchToPDF(tickets, event, batch, onProgress);
   },
 
+  // Optimized A4 Printing PDF Generation (12 tickets of 90x50 mm per A4 page)
+  async exportTicketsA4PDF(
+    ticketIds: string[],
+    onProgress?: (current: number, total: number) => void
+  ): Promise<void> {
+    const tickets = ticketIds
+      .map(id => this.getTicketById(id))
+      .filter((t): t is Ticket => Boolean(t));
+    if (tickets.length === 0) throw new Error('Nenhum ingresso válido selecionado');
+    const event = this.getEventById(tickets[0].eventId);
+    if (!event) throw new Error('Evento vinculado não encontrado');
+    const batch = this.getBatchById(tickets[0].batchId);
+    await exportTicketsBatchToA4PDF(tickets, event, batch, onProgress);
+  },
+
+  async exportBatchTicketsA4PDF(
+    batchId: string,
+    onProgress?: (current: number, total: number) => void
+  ): Promise<void> {
+    const batch = this.getBatchById(batchId);
+    if (!batch) throw new Error('Lote não encontrado');
+    const event = this.getEventById(batch.eventId);
+    if (!event) throw new Error('Evento vinculado não encontrado');
+    const tickets = this.getTickets(undefined, batch.eventId).filter(t => t.batchId === batch.id);
+    if (tickets.length === 0) throw new Error('Nenhum ingresso gerado para este lote');
+    await exportTicketsBatchToA4PDF(tickets, event, batch, onProgress);
+  },
+
   async generateTicketPDFBlob(ticketId: string): Promise<Blob> {
     const ticket = this.getTicketById(ticketId);
     if (!ticket) throw new Error('Ingresso não encontrado');
@@ -775,6 +814,17 @@ export const StorageService = {
     if (!event) throw new Error('Evento vinculado não encontrado');
     const batch = this.getBatchById(ticket.batchId);
     return await generateTicketsPDFBlob([ticket], event, batch);
+  },
+
+  async generateA4TicketsPDFBlob(ticketIds: string[]): Promise<Blob> {
+    const tickets = ticketIds
+      .map(id => this.getTicketById(id))
+      .filter((t): t is Ticket => Boolean(t));
+    if (tickets.length === 0) throw new Error('Nenhum ingresso válido');
+    const event = this.getEventById(tickets[0].eventId);
+    if (!event) throw new Error('Evento não encontrado');
+    const batch = this.getBatchById(tickets[0].batchId);
+    return await generateA4TicketsPDFBlob(tickets, event, batch);
   },
 
   // Sales
@@ -1468,6 +1518,115 @@ export const StorageService = {
       logs.pop();
     }
     setItem(STORAGE_KEYS.AUDIT_LOGS, logs);
+  },
+
+  logRoutingError(params: {
+    attemptedSlug: string | null | undefined;
+    sourceComponent?: string;
+    sourceUrl?: string;
+    referrer?: string;
+  }): {
+    logged: boolean;
+    classification: string;
+    details: string;
+  } {
+    const rawSlug = params.attemptedSlug ?? '';
+    const trimmed = rawSlug.trim();
+    const sourceComponent = params.sourceComponent || 'PublicEventPageView';
+    const sourceUrl = params.sourceUrl || (typeof window !== 'undefined' ? window.location.href : '');
+    const referrer = params.referrer || (typeof document !== 'undefined' ? document.referrer || 'Acesso Direto' : 'N/A');
+    const userAgent = typeof navigator !== 'undefined' ? navigator.userAgent : 'N/A';
+
+    // 1. Diagnostics & Classification
+    let classification: 'SLUG_VAZIO' | 'CARACTERES_INVALIDOS_OU_CORROMPIDOS' | 'FORMATO_MALFORMADO' | 'EVENTO_INEXISTENTE' = 'EVENTO_INEXISTENTE';
+    let diagnosticReason = '';
+
+    if (!trimmed) {
+      classification = 'SLUG_VAZIO';
+      diagnosticReason = 'Nenhum slug foi informado na rota de evento (tentativa de acesso direto à raiz /evento).';
+    } else {
+      let isDecodeError = false;
+      try {
+        decodeURIComponent(rawSlug);
+      } catch (err) {
+        isDecodeError = true;
+      }
+
+      // Check suspicious / illegal characters (HTML tags, quotes, backslashes, braces, control chars)
+      const illegalPattern = /[<>'"`;\\{}[\]^~|`\x00-\x1F\x7F]/;
+      if (isDecodeError) {
+        classification = 'CARACTERES_INVALIDOS_OU_CORROMPIDOS';
+        diagnosticReason = `Slug contém sequência de escape percentual (URI encoding) corrompida ou incompleta: "${rawSlug}".`;
+      } else if (illegalPattern.test(rawSlug)) {
+        classification = 'CARACTERES_INVALIDOS_OU_CORROMPIDOS';
+        diagnosticReason = `Slug contém caracteres ilegais ou símbolos suspeitos de corrupção/injeção: "${rawSlug}".`;
+      } else if (
+        trimmed.includes('--') ||
+        trimmed.startsWith('-') ||
+        trimmed.endsWith('-') ||
+        trimmed.length > 120 ||
+        trimmed.length < 2 ||
+        /\s/.test(trimmed)
+      ) {
+        classification = 'FORMATO_MALFORMADO';
+        diagnosticReason = `Slug com formatação mal-formada (hífens múltiplos consecutivos, espaços em branco, tamanho anormal [${trimmed.length} caracteres] ou delimitadores inválidos): "${rawSlug}".`;
+      } else {
+        classification = 'EVENTO_INEXISTENTE';
+        diagnosticReason = `Slug com formato sintaticamente aceitável, porém não corresponde a nenhum evento ativo ou cadastrado na base de dados: "${rawSlug}".`;
+      }
+    }
+
+    // 2. Intelligent Event Match Suggestion (helps support identify intended event)
+    let suggestionText = 'Nenhuma sugestão aproximada identificada';
+    if (trimmed) {
+      const cleanSearch = trimmed.toLowerCase().replace(/[^a-z0-9]/g, '');
+      const allEvents = this.getEvents();
+      const bestMatch = allEvents.find(e => {
+        const eClean = (e.slug || e.name).toLowerCase().replace(/[^a-z0-9]/g, '');
+        return (
+          eClean.includes(cleanSearch) ||
+          cleanSearch.includes(eClean.substring(0, Math.min(eClean.length, 6)))
+        );
+      });
+      if (bestMatch) {
+        suggestionText = `Sugestão para suporte: "${bestMatch.name}" (URL correta: /evento/${bestMatch.slug || bestMatch.id})`;
+      }
+    }
+
+    // 3. Deduplication per session/runtime to prevent spamming logs on re-renders
+    const dedupKey = `${classification}_${trimmed}_${sourceComponent}`;
+    if (loggedRoutingErrors.has(dedupKey)) {
+      return { logged: false, classification, details: diagnosticReason };
+    }
+    loggedRoutingErrors.add(dedupKey);
+
+    // 4. Silent Console Diagnostic Output
+    console.warn(`[AUDITORIA DE ROTEAMENTO - EVENTO NÃO ENCONTRADO]`, {
+      classificacao: classification,
+      slugTentado: rawSlug || '(vazio)',
+      diagnostico: diagnosticReason,
+      sugestao: suggestionText,
+      origemComponente: sourceComponent,
+      url: sourceUrl,
+      referrer,
+      userAgent,
+      timestamp: new Date().toISOString()
+    });
+
+    // 5. Audit Log Registration
+    const companyId = this.getCurrentCompanyId();
+    const details = `[${classification}] ${diagnosticReason} | ${suggestionText} | URL: ${sourceUrl} | Referrer: ${referrer}`;
+
+    this.addAuditLog(
+      companyId,
+      'sys-router-audit',
+      'Auditoria de Roteamento Público',
+      'ADMIN',
+      `Erro de Roteamento (${classification})`,
+      details
+    );
+
+    return { logged: true, classification, details: diagnosticReason };
   },
 
   // Dashboard & Metrics Calculation

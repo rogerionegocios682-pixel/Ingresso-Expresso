@@ -60,6 +60,7 @@ export interface Event {
   slug?: string;
   bannerImage?: string;
   attractions?: string[];
+  logoImage?: string; // LOGOMARCA OFICIAL DO EVENTO
 }
 
 export type BatchStatus = 'active' | 'exhausted' | 'inactive';

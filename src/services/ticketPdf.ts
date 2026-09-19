@@ -4,14 +4,21 @@ import { Event, Ticket, TicketBatch } from '../types';
 
 /**
  * Utility to convert an image URL or base64 into a clean Data URL for jsPDF.
- * Includes a timeout and graceful error catching to prevent hangs.
+ * Preserves PNG transparency when applicable, and includes a timeout and graceful
+ * error catching to prevent hangs.
  */
-async function getCleanImageDataUrl(url?: string): Promise<string | null> {
+export async function getCleanImageDataUrl(url?: string): Promise<{ dataUrl: string; format: 'PNG' | 'JPEG' } | null> {
   if (!url || !url.trim()) return null;
-  if (url.startsWith('data:image/')) return url;
+
+  const isPng = url.toLowerCase().includes('.png') || url.startsWith('data:image/png');
+  const format = isPng ? 'PNG' : 'JPEG';
+
+  if (url.startsWith('data:image/')) {
+    return { dataUrl: url, format };
+  }
 
   try {
-    const loadImagePromise = new Promise<string | null>((resolve) => {
+    const loadImagePromise = new Promise<{ dataUrl: string; format: 'PNG' | 'JPEG' } | null>((resolve) => {
       const img = new Image();
       img.crossOrigin = 'anonymous';
       img.onload = () => {
@@ -25,8 +32,8 @@ async function getCleanImageDataUrl(url?: string): Promise<string | null> {
             return;
           }
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-          const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
-          resolve(dataUrl);
+          const dataUrl = canvas.toDataURL(isPng ? 'image/png' : 'image/jpeg', 0.9);
+          resolve({ dataUrl, format });
         } catch {
           resolve(null);
         }
@@ -52,7 +59,7 @@ async function getCleanImageDataUrl(url?: string): Promise<string | null> {
  */
 async function generateQrDataUrl(token: string): Promise<string> {
   return await QRCode.toDataURL(token, {
-    width: 300,
+    width: 320,
     margin: 1,
     color: {
       dark: '#0f172a', // Slate 900
@@ -63,131 +70,238 @@ async function generateQrDataUrl(token: string): Promise<string> {
 }
 
 /**
- * Renders a single 9cm x 5cm ticket on the active jsPDF page.
- * Format: 90 mm (width) x 50 mm (height).
+ * Mathematical Layout Geometry for A4 Printing
+ * Individual ticket: 90 mm x 50 mm
+ * A4 Sheet: 297 mm x 210 mm (Landscape)
+ * Columns: 3 (3 x 90 = 270 mm, left/right margins = 13.5 mm)
+ * Rows: 4 (4 x 50 = 200 mm, top/bottom margins = 5.0 mm)
+ * Max capacity: 12 tickets per A4 sheet
  */
-function renderTicketPage(
+export interface A4LayoutCalculation {
+  orientation: 'landscape' | 'portrait';
+  pageWidth: number;
+  pageHeight: number;
+  ticketWidth: number;
+  ticketHeight: number;
+  columns: number;
+  rows: number;
+  ticketsPerPage: number;
+  marginLeft: number;
+  marginTop: number;
+  gapX: number;
+  gapY: number;
+}
+
+export function calculateA4Layout(): A4LayoutCalculation {
+  const pageWidth = 297; // Landscape A4 mm
+  const pageHeight = 210; // Landscape A4 mm
+  const ticketWidth = 90; // 9 cm
+  const ticketHeight = 50; // 5 cm
+
+  const columns = Math.floor(pageWidth / ticketWidth); // 3
+  const rows = Math.floor(pageHeight / ticketHeight); // 4
+  const ticketsPerPage = columns * rows; // 12
+
+  const marginLeft = (pageWidth - columns * ticketWidth) / 2; // 13.5 mm
+  const marginTop = (pageHeight - rows * ticketHeight) / 2; // 5.0 mm
+
+  return {
+    orientation: 'landscape',
+    pageWidth,
+    pageHeight,
+    ticketWidth,
+    ticketHeight,
+    columns,
+    rows,
+    ticketsPerPage,
+    marginLeft,
+    marginTop,
+    gapX: 0,
+    gapY: 0
+  };
+}
+
+/**
+ * Renders a single 90 mm x 50 mm ticket at the given (originX, originY) coordinates.
+ * Supports both standalone 90x50 mm pages (originX=0, originY=0) and tiled A4 sheets.
+ * Integrates Cover Image and Event Logo proportionally and cleanly.
+ */
+export function renderTicket(
   doc: jsPDF,
   ticket: Ticket,
   event: Event,
   batch: TicketBatch | undefined,
   qrDataUrl: string,
-  eventArtworkDataUrl: string | null
+  coverImage: { dataUrl: string; format: 'PNG' | 'JPEG' } | null,
+  logoImage: { dataUrl: string; format: 'PNG' | 'JPEG' } | null,
+  originX: number = 0,
+  originY: number = 0,
+  drawCutMarks: boolean = false
 ): void {
-  // --- 1. BASE BACKGROUND & OUTER BOUNDARY (90 mm x 50 mm) ---
+  const w = 90;
+  const h = 50;
+
+  // --- 1. BASE BACKGROUND & TICKET CONTAINER (90 mm x 50 mm) ---
   doc.setFillColor(255, 255, 255);
-  doc.rect(0, 0, 90, 50, 'F');
+  doc.rect(originX, originY, w, h, 'F');
 
-  // Outer subtle frame (1mm margin from physical edges)
+  // Outer subtle frame (0.8mm from physical ticket edges)
   doc.setDrawColor(226, 232, 240); // slate-200
-  doc.setLineWidth(0.3);
-  doc.roundedRect(1, 1, 88, 48, 1.2, 1.2, 'S');
+  doc.setLineWidth(0.25);
+  doc.roundedRect(originX + 0.8, originY + 0.8, w - 1.6, h - 1.6, 1.0, 1.0, 'S');
 
-  // --- 2. HEADER: EVENT ARTWORK & EVENT METADATA (Height: 14.2 mm) ---
-  const headerY = 1.2;
+  // Optional cutting guidelines / crop marks when printing on A4 sheet
+  if (drawCutMarks) {
+    doc.setDrawColor(203, 213, 225); // slate-300
+    doc.setLineWidth(0.15);
+    doc.setLineDashPattern([1.0, 1.0], 0);
+    doc.rect(originX, originY, w, h, 'S');
+    doc.setLineDashPattern([], 0);
+
+    // Corner crop tick marks
+    doc.setDrawColor(148, 163, 184); // slate-400
+    doc.setLineWidth(0.2);
+    // Top-left
+    doc.line(originX - 2, originY, originX, originY);
+    doc.line(originX, originY - 2, originX, originY);
+    // Top-right
+    doc.line(originX + w, originY, originX + w + 2, originY);
+    doc.line(originX + w, originY - 2, originX + w, originY);
+    // Bottom-left
+    doc.line(originX - 2, originY + h, originX, originY + h);
+    doc.line(originX, originY + h, originX, originY + h + 2);
+    // Bottom-right
+    doc.line(originX + w, originY + h, originX + w + 2, originY + h);
+    doc.line(originX + w, originY + h, originX + w, originY + h + 2);
+  }
+
+  // --- 2. HEADER: EVENT COVER, LOGO & METADATA (Height: 14.5 mm) ---
+  const headerY = originY + 1.0;
   const headerH = 14.2;
 
   // Solid dark premium header background
   doc.setFillColor(9, 13, 22); // Deep Slate
-  doc.rect(1.2, headerY, 87.6, headerH, 'F');
+  doc.rect(originX + 1.0, headerY, w - 2.0, headerH, 'F');
 
-  let textStartX = 3.8;
-  const maxTitleWidth = eventArtworkDataUrl ? 61 : 82;
+  let textStartX = originX + 3.0;
 
-  // Event Artwork Thumbnail / Banner Frame
-  if (eventArtworkDataUrl) {
+  // Render Event Cover Artwork Thumbnail
+  if (coverImage) {
     try {
-      const artW = 20;
+      const artW = 18;
       const artH = 11.8;
-      const artX = 2.5;
+      const artX = originX + 2.4;
       const artY = headerY + 1.2;
 
-      // Draw artwork
-      doc.addImage(eventArtworkDataUrl, 'JPEG', artX, artY, artW, artH);
+      doc.addImage(coverImage.dataUrl, coverImage.format, artX, artY, artW, artH);
 
-      // Subtle border around artwork
+      // Border around cover
       doc.setDrawColor(71, 85, 105);
-      doc.setLineWidth(0.25);
+      doc.setLineWidth(0.2);
       doc.rect(artX, artY, artW, artH, 'S');
 
-      textStartX = 24.5;
+      textStartX = originX + 22.0;
     } catch {
-      textStartX = 3.8;
+      textStartX = originX + 3.0;
+    }
+  }
+
+  // Render Event Logo (placed in header or right before stub)
+  let headerRightMargin = originX + 58.0;
+  if (logoImage) {
+    try {
+      const logoBoxW = 13.5;
+      const logoBoxH = 11.5;
+      const logoX = originX + 59.0 - logoBoxW - 1.5;
+      const logoY = headerY + 1.35;
+
+      // Clean background pill for logo if dark
+      doc.setFillColor(15, 23, 42);
+      doc.roundedRect(logoX - 0.5, logoY - 0.5, logoBoxW + 1.0, logoBoxH + 1.0, 0.6, 0.6, 'F');
+
+      doc.addImage(logoImage.dataUrl, logoImage.format, logoX, logoY, logoBoxW, logoBoxH);
+
+      headerRightMargin = logoX - 1.5;
+    } catch {
+      headerRightMargin = originX + 58.0;
     }
   }
 
   // Event Name (Bold white)
   doc.setTextColor(255, 255, 255);
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(8.2);
-  const rawEventName = (event.name || ticket.eventName || 'EVENTO').toUpperCase();
-  const truncatedEventName = rawEventName.length > (eventArtworkDataUrl ? 32 : 44)
-    ? rawEventName.slice(0, eventArtworkDataUrl ? 30 : 42) + '...'
-    : rawEventName;
-  doc.text(truncatedEventName, textStartX, headerY + 4.5);
+  doc.setFontSize(7.6);
 
-  // Date and Time (Sky Blue / High visibility)
+  const availableTitleChars = Math.max(16, Math.floor((headerRightMargin - textStartX) * 1.6));
+  const rawEventName = (event.name || ticket.eventName || 'EVENTO').toUpperCase();
+  const truncatedEventName = rawEventName.length > availableTitleChars
+    ? rawEventName.slice(0, availableTitleChars - 2) + '...'
+    : rawEventName;
+  doc.text(truncatedEventName, textStartX, headerY + 4.4);
+
+  // Date and Time (Sky Blue / High contrast)
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(5.8);
+  doc.setFontSize(5.6);
   doc.setTextColor(56, 189, 248); // sky-400
   const formattedDate = event.date ? event.date.split('-').reverse().join('/') : '';
   const dateStr = formattedDate ? `DATA: ${formattedDate}` : 'DATA A DEFINIR';
   const timeStr = event.startTime ? `ÀS ${event.startTime}` : '';
-  doc.text(`${dateStr} ${timeStr}`.trim(), textStartX, headerY + 8.4);
+  doc.text(`${dateStr} ${timeStr}`.trim(), textStartX, headerY + 8.3);
 
   // Venue & City (Soft light gray)
   doc.setFont('helvetica', 'normal');
-  doc.setFontSize(5.2);
+  doc.setFontSize(5.0);
   doc.setTextColor(203, 213, 225); // slate-300
   const venueStr = (event.venue || event.address || 'Portaria Principal').toUpperCase();
   const cityStr = event.city ? `• ${event.city.toUpperCase()}` : '';
   const fullVenue = `${venueStr} ${cityStr}`.trim();
-  const truncatedVenue = fullVenue.length > (eventArtworkDataUrl ? 36 : 50)
-    ? fullVenue.slice(0, eventArtworkDataUrl ? 34 : 48) + '...'
+  const availableVenueChars = Math.max(18, Math.floor((headerRightMargin - textStartX) * 2.0));
+  const truncatedVenue = fullVenue.length > availableVenueChars
+    ? fullVenue.slice(0, availableVenueChars - 2) + '...'
     : fullVenue;
-  doc.text(truncatedVenue, textStartX, headerY + 12.2);
+  doc.text(truncatedVenue, textStartX, headerY + 12.0);
 
-  // --- 3. PERFORATION DIVIDER & NOTCHES (x = 59 mm) ---
-  const stubDividerX = 59;
+  // --- 3. PERFORATION DIVIDER & NOTCHES (x = originX + 59 mm) ---
+  const stubDividerX = originX + 59.0;
 
-  // Semicircular notches at top and bottom of perforation line (realistic ticket look)
+  // Semicircular notches at top and bottom of perforation line
   doc.setFillColor(255, 255, 255);
   doc.circle(stubDividerX, headerY + headerH, 1.2, 'F');
-  doc.circle(stubDividerX, 48.8, 1.2, 'F');
+  doc.circle(stubDividerX, originY + 48.8, 1.2, 'F');
 
   // Perforated line
   doc.setDrawColor(203, 213, 225); // slate-300
   doc.setLineWidth(0.25);
   doc.setLineDashPattern([1.2, 0.8], 0);
-  doc.line(stubDividerX, headerY + headerH + 1.2, stubDividerX, 47.6);
+  doc.line(stubDividerX, headerY + headerH + 1.2, stubDividerX, originY + 47.6);
   doc.setLineDashPattern([], 0); // Reset dash
 
-  // --- 4. TICKET BODY: LEFT COLUMN (x = 2 to 58 mm, width = 56 mm) ---
+  // --- 4. TICKET BODY: LEFT COLUMN (x = originX + 2.5 to 58 mm) ---
   // Batch & Ticket Category Badge
   doc.setFillColor(238, 242, 255); // indigo-50
   doc.setDrawColor(199, 210, 254); // indigo-200
   doc.setLineWidth(0.2);
-  doc.roundedRect(3, 17, 53, 6, 0.8, 0.8, 'FD');
+  doc.roundedRect(originX + 2.5, originY + 16.8, 54, 5.8, 0.8, 0.8, 'FD');
 
   doc.setTextColor(67, 56, 202); // indigo-700
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(6.8);
+  doc.setFontSize(6.5);
   const rawBatch = ticket.batchName || batch?.name || '1º LOTE';
   const rawType = ticket.ticketTypeName || 'INGRESSO';
   const batchLabel = `${rawBatch} • ${rawType}`.toUpperCase();
-  doc.text(batchLabel.length > 32 ? batchLabel.slice(0, 30) + '...' : batchLabel, 5, 21.2);
+  doc.text(batchLabel.length > 33 ? batchLabel.slice(0, 31) + '...' : batchLabel, originX + 4.5, originY + 20.8);
 
   // Customer / Bearer
   doc.setTextColor(100, 116, 139); // slate-500
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(4.8);
-  doc.text('TITULAR / PORTADOR:', 3.5, 26);
+  doc.setFontSize(4.6);
+  doc.text('TITULAR / PORTADOR:', originX + 3.0, originY + 25.8);
 
   doc.setTextColor(15, 23, 42); // slate-900
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(6.6);
+  doc.setFontSize(6.4);
   const attendeeName = (ticket.customerName || 'INGRESSO AO PORTADOR').toUpperCase();
-  doc.text(attendeeName.length > 29 ? attendeeName.slice(0, 27) + '...' : attendeeName, 3.5, 29.5);
+  doc.text(attendeeName.length > 30 ? attendeeName.slice(0, 28) + '...' : attendeeName, originX + 3.0, originY + 29.2);
 
   // Document or Contact line
   doc.setTextColor(100, 116, 139);
@@ -199,48 +313,48 @@ function renderTicketPage(
   } else if (ticket.customerPhone) {
     docLine = `TEL: ${ticket.customerPhone}`;
   } else {
-    docLine = 'Ingresso Individual com Autenticação Antifraude';
+    docLine = 'Ingresso Oficial com Autenticação Antifraude';
   }
-  doc.text(docLine, 3.5, 33);
+  doc.text(docLine, originX + 3.0, originY + 32.8);
 
   // Venue Access instructions
   doc.setTextColor(100, 116, 139);
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(4.8);
-  doc.text('LOCAL / PORTARIA:', 3.5, 37);
+  doc.setFontSize(4.6);
+  doc.text('LOCAL / PORTARIA:', originX + 3.0, originY + 36.8);
 
   doc.setTextColor(51, 65, 85);
   doc.setFont('helvetica', 'normal');
-  doc.setFontSize(5.2);
+  doc.setFontSize(5.0);
   const gateInfo = (event.venue ? `${event.venue}` : 'Portaria Principal').toUpperCase();
-  doc.text(gateInfo.length > 32 ? gateInfo.slice(0, 30) + '...' : gateInfo, 3.5, 40.2);
+  doc.text(gateInfo.length > 34 ? gateInfo.slice(0, 32) + '...' : gateInfo, originX + 3.0, originY + 40.0);
 
   // Price & Payment
   doc.setTextColor(15, 23, 42);
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(6.6);
+  doc.setFontSize(6.4);
   const priceFormatted = ticket.price === 0
     ? 'CORTESIA (R$ 0,00)'
     : `VALOR: R$ ${ticket.price.toFixed(2).replace('.', ',')}`;
   const payMethod = ticket.paymentMethod ? ` (${ticket.paymentMethod.toUpperCase()})` : '';
-  doc.text(`${priceFormatted}${payMethod}`, 3.5, 44.5);
+  doc.text(`${priceFormatted}${payMethod}`, originX + 3.0, originY + 44.2);
 
   // Anti-fraud micro notice
   doc.setTextColor(148, 163, 184); // slate-400
   doc.setFont('helvetica', 'normal');
-  doc.setFontSize(4.2);
-  doc.text('Válido p/ 1 entrada única • Apresente na portaria • Proibida reprodução', 3.5, 47.8);
+  doc.setFontSize(4.0);
+  doc.text('Válido p/ 1 entrada única • Apresente na portaria • Proibida reprodução', originX + 3.0, originY + 47.8);
 
-  // --- 5. TICKET STUB: RIGHT COLUMN (x = 59 to 89 mm, width = 30 mm) ---
+  // --- 5. TICKET STUB: RIGHT COLUMN (x = originX + 59 to 89 mm, width = 30 mm) ---
   // Stub Header
   doc.setTextColor(100, 116, 139);
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(4.6);
-  doc.text('CONTROLE DE ACESSO', 74, 18, { align: 'center' });
+  doc.setFontSize(4.5);
+  doc.text('CONTROLE DE ACESSO', originX + 74.0, originY + 17.6, { align: 'center' });
 
   // High Resolution QR Code Image (22.5 mm x 22.5 mm, centered on stub)
-  const qrX = 62.75;
-  const qrY = 19.5;
+  const qrX = originX + 62.75;
+  const qrY = originY + 19.0;
   const qrSize = 22.5;
   try {
     doc.addImage(qrDataUrl, 'PNG', qrX, qrY, qrSize, qrSize);
@@ -251,22 +365,103 @@ function renderTicketPage(
   // Structured Sequential Ticket Code (Centered below QR code)
   doc.setTextColor(15, 23, 42);
   doc.setFont('courier', 'bold');
-  doc.setFontSize(6.4);
+  doc.setFontSize(6.2);
   const codeText = ticket.ticketNumber || ticket.id;
-  doc.text(codeText, 74, 44.4, { align: 'center' });
+  doc.text(codeText, originX + 74.0, originY + 44.2, { align: 'center' });
 
   // Security Hash verification string (Last 8 chars)
   doc.setTextColor(100, 116, 139);
   doc.setFont('helvetica', 'normal');
-  doc.setFontSize(4.4);
+  doc.setFontSize(4.3);
   const tokenClean = ticket.validationToken || '';
   const tokenHash = tokenClean.length > 8 ? tokenClean.slice(-8).toUpperCase() : tokenClean.toUpperCase() || 'VALID';
-  doc.text(`HASH: #${tokenHash}`, 74, 47.6, { align: 'center' });
+  doc.text(`HASH: #${tokenHash}`, originX + 74.0, originY + 47.4, { align: 'center' });
 }
 
 /**
- * Creates and compiles a jsPDF document containing the given tickets.
- * Formats every page to exactly 9cm x 5cm (90mm x 50mm landscape).
+ * Creates and compiles a jsPDF document containing the given tickets formatted for
+ * OPTIMIZED A4 PRINTING (12 tickets per sheet, 90mm x 50mm each, landscape orientation).
+ */
+export async function generateA4TicketsPDFDocument(
+  tickets: Ticket[],
+  event: Event,
+  batch?: TicketBatch,
+  onProgress?: (current: number, total: number) => void
+): Promise<jsPDF> {
+  if (!tickets || tickets.length === 0) {
+    throw new Error('Nenhum ingresso fornecido para geração do PDF A4.');
+  }
+
+  const layout = calculateA4Layout();
+
+  // Create A4 document in Landscape orientation
+  const doc = new jsPDF({
+    orientation: 'landscape',
+    unit: 'mm',
+    format: 'a4'
+  });
+
+  // Pre-load event cover and logo images once for ultra-fast rendering
+  const [coverImage, logoImage] = await Promise.all([
+    getCleanImageDataUrl(event.coverImage || batch?.artworkUrl),
+    getCleanImageDataUrl(event.logoImage)
+  ]);
+
+  const totalTickets = tickets.length;
+  const totalPages = Math.ceil(totalTickets / layout.ticketsPerPage);
+
+  for (let pageIndex = 0; pageIndex < totalPages; pageIndex++) {
+    if (pageIndex > 0) {
+      doc.addPage('a4', 'landscape');
+    }
+
+    onProgress?.(pageIndex + 1, totalPages);
+
+    // Subtle header note at top margin of sheet for production/printing reference
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(6.5);
+    doc.setTextColor(148, 163, 184); // slate-400
+    const printInfo = `${(event.name || 'EVENTO').toUpperCase()} • LOTE: ${(batch?.name || tickets[0]?.batchName || 'GERAL').toUpperCase()} • PÁGINA ${pageIndex + 1} DE ${totalPages} • FORMATO 90x50 MM (12 INGRESSOS/FOLHA A4)`;
+    doc.text(printInfo, layout.pageWidth / 2, 3.8, { align: 'center' });
+
+    // Render tickets on this page (up to 12)
+    const startIndex = pageIndex * layout.ticketsPerPage;
+    const endIndex = Math.min(startIndex + layout.ticketsPerPage, totalTickets);
+
+    for (let i = startIndex; i < endIndex; i++) {
+      const ticket = tickets[i];
+      const slotIndex = i - startIndex;
+      const col = slotIndex % layout.columns;
+      const row = Math.floor(slotIndex / layout.columns);
+
+      const originX = layout.marginLeft + col * layout.ticketWidth;
+      const originY = layout.marginTop + row * layout.ticketHeight;
+
+      // Generate unique QR code for each individual ticket
+      const qrDataUrl = await generateQrDataUrl(ticket.validationToken || ticket.ticketNumber);
+
+      // Render the ticket with subtle cutting marks enabled
+      renderTicket(
+        doc,
+        ticket,
+        event,
+        batch,
+        qrDataUrl,
+        coverImage,
+        logoImage,
+        originX,
+        originY,
+        true // drawCutMarks = true for A4 sheet
+      );
+    }
+  }
+
+  return doc;
+}
+
+/**
+ * Creates and compiles a jsPDF document containing the given tickets in STANDALONE 90mm x 50mm format.
+ * (1 ticket per page, exactly 9cm x 5cm).
  */
 export async function generateTicketsPDFDocument(
   tickets: Ticket[],
@@ -285,8 +480,11 @@ export async function generateTicketsPDFDocument(
     format: [90, 50]
   });
 
-  // Pre-load event artwork once for efficiency across all tickets
-  const artworkDataUrl = await getCleanImageDataUrl(event.coverImage || batch?.artworkUrl);
+  // Pre-load event cover and logo images once for ultra-fast rendering
+  const [coverImage, logoImage] = await Promise.all([
+    getCleanImageDataUrl(event.coverImage || batch?.artworkUrl),
+    getCleanImageDataUrl(event.logoImage)
+  ]);
 
   const total = tickets.length;
 
@@ -301,14 +499,27 @@ export async function generateTicketsPDFDocument(
     // Generate unique QR code for this ticket
     const qrDataUrl = await generateQrDataUrl(ticket.validationToken || ticket.ticketNumber);
 
-    renderTicketPage(doc, ticket, event, batch, qrDataUrl, artworkDataUrl);
+    renderTicket(doc, ticket, event, batch, qrDataUrl, coverImage, logoImage, 0, 0, false);
   }
 
   return doc;
 }
 
 /**
- * Generates a PDF Blob for the provided tickets (exact 9cm x 5cm dimensions).
+ * Generates an A4 PDF Blob for the provided tickets (12 tickets per sheet).
+ */
+export async function generateA4TicketsPDFBlob(
+  tickets: Ticket[],
+  event: Event,
+  batch?: TicketBatch,
+  onProgress?: (current: number, total: number) => void
+): Promise<Blob> {
+  const doc = await generateA4TicketsPDFDocument(tickets, event, batch, onProgress);
+  return doc.output('blob');
+}
+
+/**
+ * Generates a PDF Blob for the provided tickets (exact 9cm x 5cm standalone pages).
  */
 export async function generateTicketsPDFBlob(
   tickets: Ticket[],
@@ -321,8 +532,26 @@ export async function generateTicketsPDFBlob(
 }
 
 /**
+ * Generate a PDF for multiple tickets formatted for A4 PRINTING (12 tickets per page) and triggers browser download.
+ */
+export async function exportTicketsBatchToA4PDF(
+  tickets: Ticket[],
+  event: Event,
+  batch?: TicketBatch,
+  onProgress?: (current: number, total: number) => void
+): Promise<void> {
+  const doc = await generateA4TicketsPDFDocument(tickets, event, batch, onProgress);
+
+  const cleanEventName = (event.name || 'evento').replace(/[^a-zA-Z0-9]/g, '_');
+  const cleanBatchName = (batch?.name || tickets[0]?.batchName || 'lote').replace(/[^a-zA-Z0-9]/g, '_');
+  const filename = `Ingressos_Folha_A4_${cleanEventName}_${cleanBatchName}_${tickets.length}un.pdf`;
+
+  doc.save(filename);
+}
+
+/**
  * Generate a PDF for multiple tickets (whole batch or selection) and triggers browser download.
- * Every ticket is strictly formatted to 9cm x 5cm (90mm x 50mm landscape).
+ * Every page is strictly 9cm x 5cm (90mm x 50mm landscape).
  */
 export async function exportTicketsBatchToPDF(
   tickets: Ticket[],

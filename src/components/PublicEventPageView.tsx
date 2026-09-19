@@ -27,17 +27,20 @@ import confetti from 'canvas-confetti';
 import { Event, TicketBatch, Ticket, Sale, PaymentMethod, User } from '../types';
 import { StorageService } from '../services/storage';
 import { formatCurrency, formatDate } from '../services/whatsapp';
+import { EventNotFound404View } from './EventNotFound404View';
 
 interface PublicEventPageViewProps {
   slugOrId: string;
   currentUser?: User | null;
   onBackToAdmin?: () => void;
+  onSelectEvent?: (slugOrId: string) => void;
 }
 
 export const PublicEventPageView: React.FC<PublicEventPageViewProps> = ({
   slugOrId,
   currentUser,
-  onBackToAdmin
+  onBackToAdmin,
+  onSelectEvent
 }) => {
   const [data, setData] = useState(() => StorageService.getPublicEventData(slugOrId));
   const [selectedBatchId, setSelectedBatchId] = useState<string>('');
@@ -83,6 +86,18 @@ export const PublicEventPageView: React.FC<PublicEventPageViewProps> = ({
   const event = data?.event;
   const company = data?.company;
   const batches = data?.batches || [];
+
+  // Silent Audit Logging: Record detailed error when event is not found due to a corrupted, malformed, or invalid slug
+  useEffect(() => {
+    if (!event) {
+      StorageService.logRoutingError({
+        attemptedSlug: slugOrId,
+        sourceComponent: 'PublicEventPageView',
+        sourceUrl: typeof window !== 'undefined' ? window.location.href : '',
+        referrer: typeof document !== 'undefined' ? document.referrer : ''
+      });
+    }
+  }, [event, slugOrId]);
 
   const selectedBatch = useMemo(() => {
     return batches.find(b => b.id === selectedBatchId);
@@ -203,25 +218,12 @@ export const PublicEventPageView: React.FC<PublicEventPageViewProps> = ({
   // Event not found view
   if (!event) {
     return (
-      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-6 text-center">
-        <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-3xl p-8 shadow-2xl space-y-4">
-          <div className="w-16 h-16 rounded-2xl bg-rose-500/10 text-rose-400 flex items-center justify-center mx-auto">
-            <AlertCircle className="w-8 h-8" />
-          </div>
-          <h1 className="text-xl font-black text-white">Evento não encontrado</h1>
-          <p className="text-sm text-slate-400">
-            O link informado não corresponde a nenhum evento ativo ou pode ter sido descontinuado.
-          </p>
-          {currentUser && onBackToAdmin && (
-            <button
-              onClick={onBackToAdmin}
-              className="w-full py-3 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-sm transition-colors cursor-pointer"
-            >
-              Voltar ao Painel Administrativo
-            </button>
-          )}
-        </div>
-      </div>
+      <EventNotFound404View
+        attemptedSlug={slugOrId}
+        currentUser={currentUser}
+        onBackToAdmin={onBackToAdmin}
+        onSelectEvent={onSelectEvent}
+      />
     );
   }
 

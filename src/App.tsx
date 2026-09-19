@@ -19,48 +19,84 @@ import { ReportsView } from './components/ReportsView';
 import { SettingsView } from './components/SettingsView';
 import { SaleToastNotification } from './components/SaleToastNotification';
 import { PublicEventPageView } from './components/PublicEventPageView';
+import { EventNotFound404View } from './components/EventNotFound404View';
 
-function detectPublicEventSlug(): string | null {
-  if (typeof window === 'undefined') return null;
+interface EventRouteInfo {
+  isEventRoute: boolean;
+  slug: string | null;
+}
 
-  // Check URL pathname (e.g. /evento/mega-festival-de-verao-2026 or /e/slug)
+function detectEventRoute(): EventRouteInfo {
+  if (typeof window === 'undefined') return { isEventRoute: false, slug: null };
+
   const path = window.location.pathname;
-  const match = path.match(/^\/(?:evento|e|event)\/([^/?#]+)/i);
-  if (match && match[1]) {
-    return decodeURIComponent(match[1]);
-  }
-
-  // Check hash (e.g. #/evento/mega-festival-de-verao-2026)
   const hash = window.location.hash;
-  const hashMatch = hash.match(/#\/(?:evento|e|event)\/([^/?#]+)/i);
-  if (hashMatch && hashMatch[1]) {
-    return decodeURIComponent(hashMatch[1]);
-  }
-
-  // Check search query (e.g. ?evento=mega-festival-de-verao-2026)
   const searchParams = new URLSearchParams(window.location.search);
-  const qEvento = searchParams.get('evento') || searchParams.get('event') || searchParams.get('e');
-  if (qEvento) {
-    return qEvento;
+
+  // 1. Pathname check: /evento, /evento/, /evento/:slug, /e, /e/, /e/:slug, /event, /event/, /event/:slug
+  const pathMatch = path.match(/^\/(?:evento|e|event)(?:\/([^/?#]*))?$/i);
+  if (pathMatch) {
+    let raw = pathMatch[1] ? pathMatch[1].trim() : '';
+    try {
+      raw = decodeURIComponent(raw);
+    } catch (e) {
+      // Keep as-is
+    }
+    raw = raw.replace(/^\/+|\/+$/g, '').trim();
+    return {
+      isEventRoute: true,
+      slug: raw || null
+    };
   }
 
-  return null;
+  // 2. Hash check: #/evento, #/evento/, #/evento/:slug, etc.
+  const hashMatch = hash.match(/^#\/?(?:evento|e|event)(?:\/([^/?#]*))?$/i);
+  if (hashMatch) {
+    let raw = hashMatch[1] ? hashMatch[1].trim() : '';
+    try {
+      raw = decodeURIComponent(raw);
+    } catch (e) {
+      // Keep as-is
+    }
+    raw = raw.replace(/^\/+|\/+$/g, '').trim();
+    return {
+      isEventRoute: true,
+      slug: raw || null
+    };
+  }
+
+  // 3. Search query check: ?evento=slug or ?evento or ?event=slug or ?e=slug
+  if (searchParams.has('evento') || searchParams.has('event') || searchParams.has('e')) {
+    let raw = searchParams.get('evento') || searchParams.get('event') || searchParams.get('e') || '';
+    try {
+      raw = decodeURIComponent(raw);
+    } catch (e) {
+      // Keep as-is
+    }
+    raw = raw.replace(/^\/+|\/+$/g, '').trim();
+    return {
+      isEventRoute: true,
+      slug: raw || null
+    };
+  }
+
+  return { isEventRoute: false, slug: null };
 }
 
 export default function App() {
   // Public Event URL State (e.g., /evento/meu-evento)
-  const [publicEventSlug, setPublicEventSlug] = useState<string | null>(detectPublicEventSlug);
+  const [eventRoute, setEventRoute] = useState<EventRouteInfo>(detectEventRoute);
 
   useEffect(() => {
     const handleLocationChange = () => {
-      setPublicEventSlug(detectPublicEventSlug());
+      setEventRoute(detectEventRoute());
     };
     window.addEventListener('popstate', handleLocationChange);
     return () => window.removeEventListener('popstate', handleLocationChange);
   }, []);
 
   const handleOpenPublicPage = (slugOrId: string) => {
-    setPublicEventSlug(slugOrId);
+    setEventRoute({ isEventRoute: true, slug: slugOrId });
     try {
       window.history.pushState(null, '', `/evento/${slugOrId}`);
     } catch (e) {
@@ -69,7 +105,7 @@ export default function App() {
   };
 
   const handleClosePublicPage = () => {
-    setPublicEventSlug(null);
+    setEventRoute({ isEventRoute: false, slug: null });
     try {
       window.history.pushState(null, '', '/');
     } catch (e) {
@@ -191,12 +227,14 @@ export default function App() {
     setFocusedEventId(null);
   };
 
-  if (publicEventSlug) {
+  // Public Event Route resolution with unified audit logging and 404 fallback
+  if (eventRoute.isEventRoute) {
     return (
       <PublicEventPageView
-        slugOrId={publicEventSlug}
+        slugOrId={eventRoute.slug || ''}
         currentUser={currentUser}
         onBackToAdmin={currentUser ? handleClosePublicPage : undefined}
+        onSelectEvent={handleOpenPublicPage}
       />
     );
   }

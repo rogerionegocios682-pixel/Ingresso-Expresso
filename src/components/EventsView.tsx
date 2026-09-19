@@ -18,11 +18,15 @@ import {
   Copy,
   Check,
   Share2,
-  Sparkles
+  Sparkles,
+  Upload,
+  Image as ImageIcon,
+  AlertCircle
 } from 'lucide-react';
 import { Event, EventStatus, User } from '../types';
 import { StorageService } from '../services/storage';
 import { formatDate } from '../services/whatsapp';
+import { validateImageFile, processAndOptimizeImage } from '../services/imageUpload';
 
 interface EventsViewProps {
   currentUser: User;
@@ -63,6 +67,7 @@ export const EventsView: React.FC<EventsViewProps> = ({
     name: '',
     description: '',
     coverImage: 'https://images.unsplash.com/photo-1492684223066-81342ee5ff30?w=1000&auto=format&fit=crop&q=80',
+    logoImage: '',
     bannerImage: '',
     slug: '',
     attractionsStr: '',
@@ -81,16 +86,22 @@ export const EventsView: React.FC<EventsViewProps> = ({
     status: 'active' as EventStatus
   });
 
+  const [isProcessingCover, setIsProcessingCover] = useState(false);
+  const [isProcessingLogo, setIsProcessingLogo] = useState(false);
+  const [imageError, setImageError] = useState<string | null>(null);
+
   const refreshEvents = () => {
     setEvents(StorageService.getEvents(currentUser.role === 'MASTER' ? undefined : companyId));
   };
 
   const handleOpenCreate = () => {
     setEditingEvent(null);
+    setImageError(null);
     setFormData({
       name: '',
       description: '',
       coverImage: 'https://images.unsplash.com/photo-1492684223066-81342ee5ff30?w=1000&auto=format&fit=crop&q=80',
+      logoImage: '',
       bannerImage: '',
       slug: '',
       attractionsStr: '',
@@ -114,10 +125,12 @@ export const EventsView: React.FC<EventsViewProps> = ({
   const handleOpenEdit = (evt: Event, e: React.MouseEvent) => {
     e.stopPropagation();
     setEditingEvent(evt);
+    setImageError(null);
     setFormData({
       name: evt.name,
       description: evt.description,
-      coverImage: evt.coverImage,
+      coverImage: evt.coverImage || '',
+      logoImage: evt.logoImage || '',
       bannerImage: evt.bannerImage || '',
       slug: evt.slug || '',
       attractionsStr: (evt.attractions || []).join(', '),
@@ -138,6 +151,55 @@ export const EventsView: React.FC<EventsViewProps> = ({
     setIsModalOpen(true);
   };
 
+  const handleCoverUpload = async (file: File) => {
+    setImageError(null);
+    const validation = validateImageFile(file);
+    if (!validation.valid) {
+      setImageError(validation.error || 'Arquivo de capa inválido.');
+      return;
+    }
+
+    try {
+      setIsProcessingCover(true);
+      const optimizedDataUrl = await processAndOptimizeImage(file, {
+        maxWidth: 1280,
+        maxHeight: 1280,
+        quality: 0.85
+      });
+      setFormData(prev => ({ ...prev, coverImage: optimizedDataUrl }));
+    } catch (err: any) {
+      console.error('Erro ao processar imagem de capa:', err);
+      setImageError(err.message || 'Falha ao processar arquivo de capa.');
+    } finally {
+      setIsProcessingCover(false);
+    }
+  };
+
+  const handleLogoUpload = async (file: File) => {
+    setImageError(null);
+    const validation = validateImageFile(file);
+    if (!validation.valid) {
+      setImageError(validation.error || 'Arquivo de logomarca inválido.');
+      return;
+    }
+
+    try {
+      setIsProcessingLogo(true);
+      const optimizedDataUrl = await processAndOptimizeImage(file, {
+        maxWidth: 600,
+        maxHeight: 600,
+        quality: 0.9,
+        forceFormat: file.type === 'image/png' ? 'image/png' : 'image/jpeg'
+      });
+      setFormData(prev => ({ ...prev, logoImage: optimizedDataUrl }));
+    } catch (err: any) {
+      console.error('Erro ao processar imagem de logo:', err);
+      setImageError(err.message || 'Falha ao processar arquivo de logomarca.');
+    } finally {
+      setIsProcessingLogo(false);
+    }
+  };
+
   const handleFormSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const attractions = formData.attractionsStr
@@ -149,6 +211,7 @@ export const EventsView: React.FC<EventsViewProps> = ({
       name: formData.name,
       description: formData.description,
       coverImage: formData.coverImage,
+      logoImage: formData.logoImage.trim() ? formData.logoImage : undefined,
       bannerImage: formData.bannerImage || undefined,
       slug: formData.slug.trim() || undefined,
       attractions,
@@ -285,6 +348,11 @@ export const EventsView: React.FC<EventsViewProps> = ({
                     alt={evt.name}
                     className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
                   />
+                  {evt.logoImage && (
+                    <div className="absolute bottom-3 left-3 w-11 h-11 rounded-xl bg-white/95 p-1 shadow-md border border-white/50 backdrop-blur-xs flex items-center justify-center overflow-hidden">
+                      <img src={evt.logoImage} alt="Logomarca" className="w-full h-full object-contain" />
+                    </div>
+                  )}
                   <div className="absolute top-3 right-3">
                     <span
                       className={`px-2.5 py-1 rounded-md text-[10px] font-black uppercase tracking-wider ${
@@ -471,15 +539,178 @@ export const EventsView: React.FC<EventsViewProps> = ({
                   />
                 </div>
 
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">URL da Imagem / Arte Oficial</label>
-                  <input
-                    type="url"
-                    value={formData.coverImage}
-                    onChange={e => setFormData({ ...formData, coverImage: e.target.value })}
-                    placeholder="https://images.unsplash.com/..."
-                    className="w-full px-3 py-2 rounded-xl border border-slate-300 text-sm focus:ring-2 focus:ring-indigo-500"
-                  />
+                {/* Identidade Visual: Logomarca e Capa do Evento para Impressão */}
+                <div className="p-4 rounded-2xl bg-indigo-50/50 border border-indigo-100 space-y-4">
+                  <div className="flex items-start justify-between">
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <ImageIcon className="w-4 h-4 text-indigo-600" />
+                        <h5 className="text-xs font-bold uppercase tracking-wider text-indigo-950">
+                          Identidade Visual dos Ingressos & Evento
+                        </h5>
+                      </div>
+                      <p className="text-[11px] text-slate-500 mt-0.5">
+                        A logomarca e a capa são aplicadas automaticamente no design dos ingressos (9x5 cm) e na diagramação em folha A4.
+                      </p>
+                    </div>
+                    <span className="px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 text-[10px] font-bold">
+                      PNG, JPG ou WEBP (máx 5MB)
+                    </span>
+                  </div>
+
+                  {imageError && (
+                    <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-800 text-xs flex items-center gap-2">
+                      <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
+                      <span>{imageError}</span>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    {/* 1. Logomarca do Evento */}
+                    <div className="bg-white p-3.5 rounded-xl border border-slate-200 space-y-2.5">
+                      <div className="flex items-center justify-between">
+                        <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                          <span>Logomarca Oficial</span>
+                          <span className="text-[10px] font-normal text-slate-400">(Fundo transparente)</span>
+                        </label>
+                        {formData.logoImage && (
+                          <button
+                            type="button"
+                            onClick={() => setFormData(prev => ({ ...prev, logoImage: '' }))}
+                            className="text-[10px] font-bold text-rose-600 hover:text-rose-800 cursor-pointer"
+                          >
+                            Remover
+                          </button>
+                        )}
+                      </div>
+
+                      {formData.logoImage ? (
+                        <div className="relative h-24 rounded-lg border border-dashed border-slate-300 bg-slate-50 flex items-center justify-center p-2 group">
+                          <img
+                            src={formData.logoImage}
+                            alt="Logo preview"
+                            className="max-h-full max-w-full object-contain"
+                          />
+                          <label className="absolute inset-0 bg-slate-900/60 opacity-0 group-hover:opacity-100 transition-opacity rounded-lg flex items-center justify-center text-white text-xs font-bold gap-1 cursor-pointer">
+                            <Upload className="w-3.5 h-3.5" />
+                            <span>Substituir Logo</span>
+                            <input
+                              type="file"
+                              accept="image/png,image/jpeg,image/webp"
+                              className="hidden"
+                              onChange={e => {
+                                const file = e.target.files?.[0];
+                                if (file) handleLogoUpload(file);
+                              }}
+                            />
+                          </label>
+                        </div>
+                      ) : (
+                        <label className="border-2 border-dashed border-slate-300 hover:border-indigo-400 rounded-xl p-4 flex flex-col items-center justify-center text-center cursor-pointer bg-slate-50/50 hover:bg-indigo-50/20 transition-all">
+                          {isProcessingLogo ? (
+                            <div className="text-xs text-indigo-600 font-semibold animate-pulse">
+                              Processando imagem...
+                            </div>
+                          ) : (
+                            <>
+                              <Upload className="w-5 h-5 text-indigo-500 mb-1" />
+                              <span className="text-xs font-semibold text-slate-700">Carregar Logomarca</span>
+                              <span className="text-[10px] text-slate-400 mt-0.5">PNG com fundo transparente</span>
+                            </>
+                          )}
+                          <input
+                            type="file"
+                            accept="image/png,image/jpeg,image/webp"
+                            className="hidden"
+                            onChange={e => {
+                              const file = e.target.files?.[0];
+                              if (file) handleLogoUpload(file);
+                            }}
+                          />
+                        </label>
+                      )}
+
+                      <input
+                        type="url"
+                        value={formData.logoImage}
+                        onChange={e => setFormData({ ...formData, logoImage: e.target.value })}
+                        placeholder="Ou cole a URL da logomarca..."
+                        className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 text-xs focus:ring-1 focus:ring-indigo-500"
+                      />
+                    </div>
+
+                    {/* 2. Capa / Arte Principal do Evento */}
+                    <div className="bg-white p-3.5 rounded-xl border border-slate-200 space-y-2.5">
+                      <div className="flex items-center justify-between">
+                        <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                          <span>Capa / Arte do Evento *</span>
+                        </label>
+                        {formData.coverImage && (
+                          <button
+                            type="button"
+                            onClick={() => setFormData(prev => ({ ...prev, coverImage: '' }))}
+                            className="text-[10px] font-bold text-rose-600 hover:text-rose-800 cursor-pointer"
+                          >
+                            Limpar
+                          </button>
+                        )}
+                      </div>
+
+                      {formData.coverImage ? (
+                        <div className="relative h-24 rounded-lg border border-slate-200 bg-slate-100 overflow-hidden group">
+                          <img
+                            src={formData.coverImage}
+                            alt="Capa preview"
+                            className="w-full h-full object-cover"
+                          />
+                          <label className="absolute inset-0 bg-slate-900/60 opacity-0 group-hover:opacity-100 transition-opacity rounded-lg flex items-center justify-center text-white text-xs font-bold gap-1 cursor-pointer">
+                            <Upload className="w-3.5 h-3.5" />
+                            <span>Substituir Capa</span>
+                            <input
+                              type="file"
+                              accept="image/png,image/jpeg,image/webp"
+                              className="hidden"
+                              onChange={e => {
+                                const file = e.target.files?.[0];
+                                if (file) handleCoverUpload(file);
+                              }}
+                            />
+                          </label>
+                        </div>
+                      ) : (
+                        <label className="border-2 border-dashed border-slate-300 hover:border-indigo-400 rounded-xl p-4 flex flex-col items-center justify-center text-center cursor-pointer bg-slate-50/50 hover:bg-indigo-50/20 transition-all">
+                          {isProcessingCover ? (
+                            <div className="text-xs text-indigo-600 font-semibold animate-pulse">
+                              Processando imagem...
+                            </div>
+                          ) : (
+                            <>
+                              <Upload className="w-5 h-5 text-indigo-500 mb-1" />
+                              <span className="text-xs font-semibold text-slate-700">Carregar Capa / Arte</span>
+                              <span className="text-[10px] text-slate-400 mt-0.5">JPG ou PNG (alta resolução)</span>
+                            </>
+                          )}
+                          <input
+                            type="file"
+                            accept="image/png,image/jpeg,image/webp"
+                            className="hidden"
+                            onChange={e => {
+                              const file = e.target.files?.[0];
+                              if (file) handleCoverUpload(file);
+                            }}
+                          />
+                        </label>
+                      )}
+
+                      <input
+                        type="url"
+                        value={formData.coverImage}
+                        onChange={e => setFormData({ ...formData, coverImage: e.target.value })}
+                        placeholder="Ou cole a URL da capa..."
+                        className="w-full px-2.5 py-1.5 rounded-lg border border-slate-200 text-xs focus:ring-1 focus:ring-indigo-500"
+                      />
+                    </div>
+                  </div>
                 </div>
 
                 <div>

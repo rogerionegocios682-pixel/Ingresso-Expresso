@@ -20,7 +20,7 @@ import {
 import { motion, AnimatePresence } from 'motion/react';
 import { Event, Ticket } from '../types';
 import { formatCurrency, formatDate, generateWhatsAppMessage, openWhatsAppChat } from '../services/whatsapp';
-import { exportTicketsBatchToPDF } from '../services/ticketPdf';
+import { exportTicketsBatchToPDF, exportTicketsBatchToA4PDF } from '../services/ticketPdf';
 
 interface TicketDisplayModalProps {
   tickets: Ticket[];
@@ -89,6 +89,7 @@ export const TicketDisplayModal: React.FC<TicketDisplayModalProps> = ({
   }, []);
 
   const [isGeneratingPdf, setIsGeneratingPdf] = useState<boolean>(false);
+  const [isGeneratingA4Pdf, setIsGeneratingA4Pdf] = useState<boolean>(false);
 
   const handleDownloadPdf = async (all: boolean = false) => {
     setIsGeneratingPdf(true);
@@ -100,6 +101,19 @@ export const TicketDisplayModal: React.FC<TicketDisplayModalProps> = ({
       alert('Não foi possível gerar o arquivo PDF do ingresso.');
     } finally {
       setIsGeneratingPdf(false);
+    }
+  };
+
+  const handleDownloadA4Pdf = async (all: boolean = false) => {
+    setIsGeneratingA4Pdf(true);
+    try {
+      const listToExport = all ? tickets : [currentTicket];
+      await exportTicketsBatchToA4PDF(listToExport, event);
+    } catch (err) {
+      console.error('Erro ao exportar PDF A4 do ingresso:', err);
+      alert('Não foi possível gerar o arquivo PDF A4 do ingresso.');
+    } finally {
+      setIsGeneratingA4Pdf(false);
     }
   };
 

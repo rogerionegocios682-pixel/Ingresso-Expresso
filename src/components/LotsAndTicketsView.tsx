@@ -21,7 +21,7 @@ import {
 import { Event, TicketBatch, BatchStatus, User, Ticket } from '../types';
 import { StorageService } from '../services/storage';
 import { formatCurrency, formatDate } from '../services/whatsapp';
-import { exportTicketsBatchToPDF } from '../services/ticketPdf';
+import { exportTicketsBatchToPDF, exportTicketsBatchToA4PDF } from '../services/ticketPdf';
 
 interface LotsAndTicketsViewProps {
   currentUser: User;
@@ -245,6 +245,52 @@ export const LotsAndTicketsView: React.FC<LotsAndTicketsViewProps> = ({
     }
   };
 
+  // Export Batch Tickets as Optimized A4 PDF (12 tickets per A4 sheet, 90x50 mm)
+  const handleExportBatchA4Pdf = async (batch: TicketBatch, ticketsToExport?: Ticket[]) => {
+    if (!selectedEvent) {
+      alert('Selecione um evento válido.');
+      return;
+    }
+
+    setIsExportingPdf(true);
+    setActivePdfBatchId(batch.id);
+
+    try {
+      let list = ticketsToExport;
+      if (!list || list.length === 0) {
+        const allEventTickets = StorageService.getTickets(
+          currentUser.role === 'MASTER' ? undefined : companyId,
+          batch.eventId
+        );
+        list = allEventTickets.filter(t => t.batchId === batch.id);
+      }
+
+      if (list.length === 0) {
+        alert('Este lote ainda não possui ingressos gerados. Clique em "Gerar Ingressos Físicos" primeiro.');
+        return;
+      }
+
+      const totalSheets = Math.ceil(list.length / 12);
+      setPdfProgressText(`Diagramando ${list.length} ingressos em ${totalSheets} folha(s) A4...`);
+
+      await exportTicketsBatchToA4PDF(
+        list,
+        selectedEvent,
+        batch,
+        (current, total) => {
+          setPdfProgressText(`Montando folha A4 ${current} de ${total}...`);
+        }
+      );
+    } catch (err) {
+      console.error('Erro ao exportar A4 PDF:', err);
+      alert('Ocorreu um erro ao gerar o PDF em folha A4.');
+    } finally {
+      setIsExportingPdf(false);
+      setActivePdfBatchId(null);
+      setPdfProgressText('');
+    }
+  };
+
   const presetTicketTypes = [
     'Pista',
     'VIP',
@@ -393,11 +439,11 @@ export const LotsAndTicketsView: React.FC<LotsAndTicketsViewProps> = ({
 
               {/* Action Buttons */}
               <div className="pt-4 mt-4 border-t border-slate-100 space-y-2">
-                <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-1.5">
                   <button
                     type="button"
                     onClick={() => handleOpenGenerateModal(batch)}
-                    className="flex items-center justify-center gap-1.5 py-2 px-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold transition-colors cursor-pointer"
+                    className="flex items-center justify-center gap-1.5 py-2 px-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold transition-colors cursor-pointer"
                   >
                     <Layers className="w-3.5 h-3.5 text-indigo-400" />
                     <span>Gerar Ingressos</span>
@@ -405,16 +451,28 @@ export const LotsAndTicketsView: React.FC<LotsAndTicketsViewProps> = ({
 
                   <button
                     type="button"
+                    title="Imprimir ingressos agrupados em folha A4 (12 por folha, 9x5 cm)"
                     disabled={isThisBatchExporting || (generatedCount === 0 && batch.soldQuantity === 0)}
-                    onClick={() => handleExportBatchPdf(batch)}
-                    className="flex items-center justify-center gap-1.5 py-2 px-2.5 rounded-xl border border-indigo-200 bg-indigo-50 hover:bg-indigo-100 disabled:opacity-40 text-indigo-700 text-xs font-bold transition-colors cursor-pointer"
+                    onClick={() => handleExportBatchA4Pdf(batch)}
+                    className="flex items-center justify-center gap-1.5 py-2 px-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 text-white text-xs font-bold transition-colors cursor-pointer shadow-2xs"
                   >
                     {isThisBatchExporting ? (
-                      <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-600" />
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-white" />
                     ) : (
-                      <FileDown className="w-3.5 h-3.5 text-indigo-600" />
+                      <Printer className="w-3.5 h-3.5 text-white" />
                     )}
-                    <span>Baixar PDF (9x5)</span>
+                    <span>Folha A4 (12 un)</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    title="Baixar ingressos em páginas individuais de 9x5 cm"
+                    disabled={isThisBatchExporting || (generatedCount === 0 && batch.soldQuantity === 0)}
+                    onClick={() => handleExportBatchPdf(batch)}
+                    className="flex items-center justify-center gap-1.5 py-2 px-2 rounded-xl border border-slate-200 bg-slate-50 hover:bg-slate-100 disabled:opacity-40 text-slate-700 text-xs font-semibold transition-colors cursor-pointer"
+                  >
+                    <FileDown className="w-3.5 h-3.5 text-slate-500" />
+                    <span>PDF 9x5</span>
                   </button>
                 </div>
 
@@ -584,33 +642,45 @@ export const LotsAndTicketsView: React.FC<LotsAndTicketsViewProps> = ({
                     <p><strong>Último ingresso:</strong> {generationSuccessInfo.tickets[generationSuccessInfo.tickets.length - 1]?.ticketNumber}</p>
                   </div>
 
-                  <div className="pt-2 flex flex-col sm:flex-row gap-2">
+                  <div className="pt-2 flex flex-col gap-2">
                     <button
                       type="button"
                       disabled={isExportingPdf}
-                      onClick={() => handleExportBatchPdf(batchForGeneration, generationSuccessInfo.tickets)}
-                      className="flex-1 flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-black text-sm shadow-md cursor-pointer"
+                      onClick={() => handleExportBatchA4Pdf(batchForGeneration, generationSuccessInfo.tickets)}
+                      className="w-full flex items-center justify-center gap-2 py-3 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-black text-sm shadow-md cursor-pointer"
                     >
-                      {isExportingPdf ? (
+                      {isExportingPdf && activePdfBatchId === batchForGeneration.id ? (
                         <>
                           <Loader2 className="w-4 h-4 animate-spin text-white" />
-                          <span>{pdfProgressText || 'DIAGRAMANDO PDF...'}</span>
+                          <span>{pdfProgressText || 'DIAGRAMANDO FOLHA A4...'}</span>
                         </>
                       ) : (
                         <>
-                          <FileDown className="w-4 h-4" />
-                          <span>BAIXAR PDF (PADRÃO 9x5 CM)</span>
+                          <Printer className="w-4 h-4" />
+                          <span>IMPRIMIR EM FOLHA A4 (12 INGRESSOS / PÁGINA)</span>
                         </>
                       )}
                     </button>
 
-                    <button
-                      type="button"
-                      onClick={() => setIsGenerateModalOpen(false)}
-                      className="py-3 px-4 rounded-xl border border-slate-300 text-slate-700 font-bold text-xs hover:bg-slate-50 cursor-pointer"
-                    >
-                      Concluir
-                    </button>
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        disabled={isExportingPdf}
+                        onClick={() => handleExportBatchPdf(batchForGeneration, generationSuccessInfo.tickets)}
+                        className="flex-1 flex items-center justify-center gap-1.5 py-2.5 px-3 rounded-xl border border-slate-300 text-slate-700 font-bold text-xs hover:bg-slate-50 cursor-pointer"
+                      >
+                        <FileDown className="w-4 h-4 text-slate-500" />
+                        <span>PDF Individual (9x5 cm)</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setIsGenerateModalOpen(false)}
+                        className="py-2.5 px-5 rounded-xl border border-slate-300 text-slate-700 font-bold text-xs hover:bg-slate-50 cursor-pointer"
+                      >
+                        Concluir
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}
