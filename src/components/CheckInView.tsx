@@ -17,7 +17,10 @@ import {
   VolumeX,
   Cloud,
   Loader2,
-  Zap
+  Zap,
+  Calendar,
+  AlertOctagon,
+  Ban
 } from 'lucide-react';
 import { User, ValidationResult, Event } from '../types';
 import { StorageService } from '../services/storage';
