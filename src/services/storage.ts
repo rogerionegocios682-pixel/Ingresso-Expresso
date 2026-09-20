@@ -26,6 +26,7 @@ import {
   updateTicketStatusInFirestore,
   saveSaleToFirestore,
   saveEventToFirestore,
+  getEventFromFirestore,
   saveBatchToFirestore,
   findTicketInFirestore,
   validateTicketWithFirestore,
@@ -393,6 +394,27 @@ export const StorageService = {
     return this.getEvents().find(e => e.id === id);
   },
 
+  async getEventByIdAsync(id: string): Promise<Event | undefined> {
+    let event = this.getEventById(id);
+    if (!event || !event.logoImage || !event.coverImage) {
+      try {
+        const firestoreEvent = await getEventFromFirestore(id);
+        if (firestoreEvent) {
+          event = { ...event, ...firestoreEvent };
+          const events = getItem<Event[]>(STORAGE_KEYS.EVENTS, INITIAL_EVENTS);
+          const idx = events.findIndex(e => e.id === id);
+          if (idx >= 0) {
+            events[idx] = { ...events[idx], ...firestoreEvent };
+            setItem(STORAGE_KEYS.EVENTS, events);
+          }
+        }
+      } catch (e) {
+        console.warn('Erro ao carregar evento atualizado do Firestore:', e);
+      }
+    }
+    return event;
+  },
+
   getEventBySlug(slugOrId: string): Event | undefined {
     if (!slugOrId) return undefined;
     let clean = slugOrId.trim();
@@ -472,6 +494,7 @@ export const StorageService = {
     };
     events.unshift(newEvent);
     setItem(STORAGE_KEYS.EVENTS, events);
+    saveEventToFirestore(newEvent);
 
     const currentUser = this.getCurrentUser();
     this.addAuditLog(
@@ -499,6 +522,7 @@ export const StorageService = {
 
     events[idx] = { ...events[idx], ...updates, slug: updatedSlug };
     setItem(STORAGE_KEYS.EVENTS, events);
+    saveEventToFirestore(events[idx]);
 
     const currentUser = this.getCurrentUser();
     this.addAuditLog(
@@ -746,7 +770,7 @@ export const StorageService = {
   async exportTicketPDF(ticketId: string): Promise<void> {
     const ticket = this.getTicketById(ticketId);
     if (!ticket) throw new Error('Ingresso não encontrado');
-    const event = this.getEventById(ticket.eventId);
+    const event = (await this.getEventByIdAsync(ticket.eventId)) || this.getEventById(ticket.eventId);
     if (!event) throw new Error('Evento vinculado não encontrado');
     const batch = this.getBatchById(ticket.batchId);
     await exportSingleTicketToPDF(ticket, event, batch);
@@ -760,7 +784,7 @@ export const StorageService = {
       .map(id => this.getTicketById(id))
       .filter((t): t is Ticket => Boolean(t));
     if (tickets.length === 0) throw new Error('Nenhum ingresso válido selecionado');
-    const event = this.getEventById(tickets[0].eventId);
+    const event = (await this.getEventByIdAsync(tickets[0].eventId)) || this.getEventById(tickets[0].eventId);
     if (!event) throw new Error('Evento vinculado não encontrado');
     const batch = this.getBatchById(tickets[0].batchId);
     await exportTicketsBatchToPDF(tickets, event, batch, onProgress);
@@ -772,7 +796,7 @@ export const StorageService = {
   ): Promise<void> {
     const batch = this.getBatchById(batchId);
     if (!batch) throw new Error('Lote não encontrado');
-    const event = this.getEventById(batch.eventId);
+    const event = (await this.getEventByIdAsync(batch.eventId)) || this.getEventById(batch.eventId);
     if (!event) throw new Error('Evento vinculado não encontrado');
     const tickets = this.getTickets(undefined, batch.eventId).filter(t => t.batchId === batch.id);
     if (tickets.length === 0) throw new Error('Nenhum ingresso gerado para este lote');
@@ -788,7 +812,7 @@ export const StorageService = {
       .map(id => this.getTicketById(id))
       .filter((t): t is Ticket => Boolean(t));
     if (tickets.length === 0) throw new Error('Nenhum ingresso válido selecionado');
-    const event = this.getEventById(tickets[0].eventId);
+    const event = (await this.getEventByIdAsync(tickets[0].eventId)) || this.getEventById(tickets[0].eventId);
     if (!event) throw new Error('Evento vinculado não encontrado');
     const batch = this.getBatchById(tickets[0].batchId);
     await exportTicketsBatchToA4PDF(tickets, event, batch, onProgress);
@@ -800,7 +824,7 @@ export const StorageService = {
   ): Promise<void> {
     const batch = this.getBatchById(batchId);
     if (!batch) throw new Error('Lote não encontrado');
-    const event = this.getEventById(batch.eventId);
+    const event = (await this.getEventByIdAsync(batch.eventId)) || this.getEventById(batch.eventId);
     if (!event) throw new Error('Evento vinculado não encontrado');
     const tickets = this.getTickets(undefined, batch.eventId).filter(t => t.batchId === batch.id);
     if (tickets.length === 0) throw new Error('Nenhum ingresso gerado para este lote');
@@ -810,7 +834,7 @@ export const StorageService = {
   async generateTicketPDFBlob(ticketId: string): Promise<Blob> {
     const ticket = this.getTicketById(ticketId);
     if (!ticket) throw new Error('Ingresso não encontrado');
-    const event = this.getEventById(ticket.eventId);
+    const event = (await this.getEventByIdAsync(ticket.eventId)) || this.getEventById(ticket.eventId);
     if (!event) throw new Error('Evento vinculado não encontrado');
     const batch = this.getBatchById(ticket.batchId);
     return await generateTicketsPDFBlob([ticket], event, batch);
@@ -821,7 +845,7 @@ export const StorageService = {
       .map(id => this.getTicketById(id))
       .filter((t): t is Ticket => Boolean(t));
     if (tickets.length === 0) throw new Error('Nenhum ingresso válido');
-    const event = this.getEventById(tickets[0].eventId);
+    const event = (await this.getEventByIdAsync(tickets[0].eventId)) || this.getEventById(tickets[0].eventId);
     if (!event) throw new Error('Evento não encontrado');
     const batch = this.getBatchById(tickets[0].batchId);
     return await generateA4TicketsPDFBlob(tickets, event, batch);

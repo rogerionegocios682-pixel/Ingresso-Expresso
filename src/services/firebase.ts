@@ -101,6 +101,29 @@ export async function saveEventToFirestore(event: Event): Promise<void> {
   }
 }
 
+// Fetch event from Firestore by ID (checks document ID and field 'id')
+export async function getEventFromFirestore(eventId: string): Promise<Event | null> {
+  if (!eventId || !eventId.trim()) return null;
+  const cleanId = eventId.trim();
+  try {
+    const docRef = doc(db, 'events', cleanId);
+    const snap = await getDocFromServer(docRef);
+    if (snap.exists()) {
+      return snap.data() as Event;
+    }
+
+    const q = query(collection(db, 'events'), where('id', '==', cleanId));
+    const querySnap = await getDocs(q);
+    if (!querySnap.empty) {
+      return querySnap.docs[0].data() as Event;
+    }
+    return null;
+  } catch (error) {
+    console.warn('Could not fetch event from Firestore:', error);
+    return null;
+  }
+}
+
 export async function saveBatchToFirestore(batch: TicketBatch): Promise<void> {
   try {
     await setDoc(doc(db, 'batches', batch.id), batch, { merge: true });

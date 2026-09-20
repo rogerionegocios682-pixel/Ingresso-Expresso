@@ -1,56 +1,168 @@
 import { jsPDF } from 'jspdf';
 import QRCode from 'qrcode';
 import { Event, Ticket, TicketBatch } from '../types';
+import { getEventFromFirestore } from './firebase';
+
+export interface CleanImageData {
+  dataUrl: string;
+  format: 'PNG' | 'JPEG';
+  aspectRatio: number; // width / height
+}
 
 /**
  * Utility to convert an image URL or base64 into a clean Data URL for jsPDF.
- * Preserves PNG transparency when applicable, and includes a timeout and graceful
- * error catching to prevent hangs.
+ * Preserves PNG transparency when applicable, calculates aspect ratio for proportionate
+ * rendering, and includes a timeout and graceful error catching to prevent hangs.
  */
-export async function getCleanImageDataUrl(url?: string): Promise<{ dataUrl: string; format: 'PNG' | 'JPEG' } | null> {
+export async function getCleanImageDataUrl(url?: string): Promise<CleanImageData | null> {
   if (!url || !url.trim()) return null;
 
   const isPng = url.toLowerCase().includes('.png') || url.startsWith('data:image/png');
-  const format = isPng ? 'PNG' : 'JPEG';
-
-  if (url.startsWith('data:image/')) {
-    return { dataUrl: url, format };
-  }
+  const format: 'PNG' | 'JPEG' = isPng ? 'PNG' : 'JPEG';
 
   try {
-    const loadImagePromise = new Promise<{ dataUrl: string; format: 'PNG' | 'JPEG' } | null>((resolve) => {
+    const loadImagePromise = new Promise<CleanImageData | null>((resolve) => {
       const img = new Image();
       img.crossOrigin = 'anonymous';
       img.onload = () => {
         try {
+          const natW = img.naturalWidth || 600;
+          const natH = img.naturalHeight || 400;
+          const aspectRatio = natW / (natH || 1);
+
+          if (url.startsWith('data:image/')) {
+            resolve({ dataUrl: url, format, aspectRatio });
+            return;
+          }
+
           const canvas = document.createElement('canvas');
-          canvas.width = img.naturalWidth || 600;
-          canvas.height = img.naturalHeight || 300;
+          canvas.width = natW;
+          canvas.height = natH;
           const ctx = canvas.getContext('2d');
           if (!ctx) {
-            resolve(null);
+            resolve({ dataUrl: url, format, aspectRatio });
             return;
           }
           ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-          const dataUrl = canvas.toDataURL(isPng ? 'image/png' : 'image/jpeg', 0.9);
-          resolve({ dataUrl, format });
+          const dataUrl = canvas.toDataURL(isPng ? 'image/png' : 'image/jpeg', 0.92);
+          resolve({ dataUrl, format, aspectRatio });
         } catch {
+          resolve({ dataUrl: url, format, aspectRatio: 1.5 });
+        }
+      };
+      img.onerror = () => {
+        if (url.startsWith('data:image/')) {
+          resolve({ dataUrl: url, format, aspectRatio: 1.5 });
+        } else {
           resolve(null);
         }
       };
-      img.onerror = () => resolve(null);
       img.src = url;
     });
 
     // 2.5s safety timeout to prevent hanging on slow network or blocked CORS
-    const timeoutPromise = new Promise<null>((resolve) => {
-      setTimeout(() => resolve(null), 2500);
+    const timeoutPromise = new Promise<CleanImageData | null>((resolve) => {
+      setTimeout(() => {
+        if (url.startsWith('data:image/')) {
+          resolve({ dataUrl: url, format, aspectRatio: 1.5 });
+        } else {
+          resolve(null);
+        }
+      }, 2500);
     });
 
     return await Promise.race([loadImagePromise, timeoutPromise]);
   } catch {
     return null;
   }
+}
+
+/**
+ * Resolves the complete event entity from the database (local storage and cloud Firestore),
+ * ensuring that the latest logoImage and coverImage are retrieved automatically
+ * even if the caller passed a partial or unpopulated event object.
+ */
+export async function resolveEventFromDatabase(
+  event?: Partial<Event>,
+  eventId?: string
+): Promise<Event> {
+  const targetId = eventId || event?.id;
+  let dbEvent: Event | undefined;
+
+  // 1. Fetch from local storage (safe, zero circular dependency)
+  try {
+    if (typeof window !== 'undefined' && window.localStorage) {
+      const raw = window.localStorage.getItem('ie_events');
+      if (raw) {
+        const events: Event[] = JSON.parse(raw);
+        if (targetId) {
+          dbEvent = events.find(e => e.id === targetId);
+        }
+        if (!dbEvent && event?.name) {
+          dbEvent = events.find(e => e.name?.toLowerCase().trim() === event.name?.toLowerCase().trim());
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Falha ao ler eventos do armazenamento local:', err);
+  }
+
+  // 2. If targetId exists and dbEvent is missing or missing either logoImage or coverImage, query Firestore directly
+  if (targetId && (!dbEvent || !dbEvent.logoImage || !dbEvent.coverImage)) {
+    try {
+      const firestoreEvent = await getEventFromFirestore(targetId);
+      if (firestoreEvent) {
+        dbEvent = { ...dbEvent, ...firestoreEvent };
+        // Sync local cache with new image assets
+        if (typeof window !== 'undefined' && window.localStorage && (firestoreEvent.logoImage || firestoreEvent.coverImage)) {
+          try {
+            const raw = window.localStorage.getItem('ie_events');
+            if (raw) {
+              const events: Event[] = JSON.parse(raw);
+              const idx = events.findIndex(e => e.id === targetId);
+              if (idx >= 0) {
+                events[idx] = { ...events[idx], ...firestoreEvent };
+                window.localStorage.setItem('ie_events', JSON.stringify(events));
+              }
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
+    } catch (err) {
+      console.warn('Falha ao buscar imagens do evento no Firestore para o PDF:', err);
+    }
+  }
+
+  // Construct complete merged event ensuring images are retained
+  const resolved: Event = {
+    id: targetId || 'evt-default',
+    companyId: event?.companyId || dbEvent?.companyId || 'comp-01',
+    name: event?.name || dbEvent?.name || 'EVENTO',
+    description: event?.description || dbEvent?.description || '',
+    date: event?.date || dbEvent?.date || '',
+    startTime: event?.startTime || dbEvent?.startTime || '',
+    endTime: event?.endTime || dbEvent?.endTime || '',
+    venue: event?.venue || dbEvent?.venue || '',
+    address: event?.address || dbEvent?.address || '',
+    city: event?.city || dbEvent?.city || '',
+    state: event?.state || dbEvent?.state || '',
+    organizerName: event?.organizerName || dbEvent?.organizerName || '',
+    docNumber: event?.docNumber || dbEvent?.docNumber || '',
+    phone: event?.phone || dbEvent?.phone || '',
+    whatsapp: event?.whatsapp || dbEvent?.whatsapp || '',
+    email: event?.email || dbEvent?.email || '',
+    status: event?.status || dbEvent?.status || 'active',
+    createdAt: event?.createdAt || dbEvent?.createdAt || new Date().toISOString(),
+    slug: event?.slug || dbEvent?.slug || '',
+    attractions: event?.attractions || dbEvent?.attractions || [],
+    coverImage: event?.coverImage || dbEvent?.coverImage || '',
+    logoImage: event?.logoImage || dbEvent?.logoImage || '',
+    bannerImage: event?.bannerImage || dbEvent?.bannerImage || ''
+  };
+
+  return resolved;
 }
 
 /**
@@ -62,7 +174,7 @@ async function generateQrDataUrl(token: string): Promise<string> {
     width: 320,
     margin: 1,
     color: {
-      dark: '#0f172a', // Slate 900
+      dark: '#000000', // Pure black modules for optical scanner accuracy
       light: '#ffffff'
     },
     errorCorrectionLevel: 'H'
@@ -71,7 +183,7 @@ async function generateQrDataUrl(token: string): Promise<string> {
 
 /**
  * Mathematical Layout Geometry for A4 Printing
- * Individual ticket: 90 mm x 50 mm
+ * Individual ticket: 90 mm x 50 mm (9 cm x 5 cm)
  * A4 Sheet: 297 mm x 210 mm (Landscape)
  * Columns: 3 (3 x 90 = 270 mm, left/right margins = 13.5 mm)
  * Rows: 4 (4 x 50 = 200 mm, top/bottom margins = 5.0 mm)
@@ -124,7 +236,7 @@ export function calculateA4Layout(): A4LayoutCalculation {
 /**
  * Renders a single 90 mm x 50 mm ticket at the given (originX, originY) coordinates.
  * Supports both standalone 90x50 mm pages (originX=0, originY=0) and tiled A4 sheets.
- * Integrates Cover Image and Event Logo proportionally and cleanly.
+ * Automatically displays the Cover Artwork and Event Logo without compromising QR Code readability.
  */
 export function renderTicket(
   doc: jsPDF,
@@ -132,8 +244,8 @@ export function renderTicket(
   event: Event,
   batch: TicketBatch | undefined,
   qrDataUrl: string,
-  coverImage: { dataUrl: string; format: 'PNG' | 'JPEG' } | null,
-  logoImage: { dataUrl: string; format: 'PNG' | 'JPEG' } | null,
+  coverImage: CleanImageData | null,
+  logoImage: CleanImageData | null,
   originX: number = 0,
   originY: number = 0,
   drawCutMarks: boolean = false
@@ -177,67 +289,137 @@ export function renderTicket(
 
   // --- 2. HEADER: EVENT COVER, LOGO & METADATA (Height: 14.5 mm) ---
   const headerY = originY + 1.0;
-  const headerH = 14.2;
+  const headerH = 14.5;
 
-  // Solid dark premium header background
+  // Solid dark premium header background across full top width
   doc.setFillColor(9, 13, 22); // Deep Slate
   doc.rect(originX + 1.0, headerY, w - 2.0, headerH, 'F');
 
-  let textStartX = originX + 3.0;
+  let textStartX = originX + 3.2;
 
-  // Render Event Cover Artwork Thumbnail
+  // A. RENDER EVENT COVER ARTWORK (Capa do Evento)
+  // Positioned on the left side of the header
   if (coverImage) {
     try {
-      const artW = 18;
-      const artH = 11.8;
-      const artX = originX + 2.4;
-      const artY = headerY + 1.2;
+      const boxW = 18.0;
+      const boxH = 12.0;
+      const boxX = originX + 2.4;
+      const boxY = headerY + 1.25;
 
-      doc.addImage(coverImage.dataUrl, coverImage.format, artX, artY, artW, artH);
+      const aspect = coverImage.aspectRatio || 1.5;
+      let renderW = boxW;
+      let renderH = boxH;
 
-      // Border around cover
-      doc.setDrawColor(71, 85, 105);
+      if (aspect > boxW / boxH) {
+        renderW = boxW;
+        renderH = boxW / aspect;
+      } else {
+        renderH = boxH;
+        renderW = boxH * aspect;
+      }
+
+      const renderX = boxX + (boxW - renderW) / 2;
+      const renderY = boxY + (boxH - renderH) / 2;
+
+      doc.addImage(coverImage.dataUrl, coverImage.format, renderX, renderY, renderW, renderH);
+
+      // Fine dark border around cover box
+      doc.setDrawColor(51, 65, 85);
       doc.setLineWidth(0.2);
-      doc.rect(artX, artY, artW, artH, 'S');
+      doc.rect(boxX, boxY, boxW, boxH, 'S');
 
       textStartX = originX + 22.0;
     } catch {
-      textStartX = originX + 3.0;
+      textStartX = originX + 3.2;
+    }
+  } else if (!coverImage && logoImage) {
+    // If no cover is present, show the logo on the left as well
+    try {
+      const boxW = 18.0;
+      const boxH = 12.0;
+      const boxX = originX + 2.4;
+      const boxY = headerY + 1.25;
+
+      const aspect = logoImage.aspectRatio || 1.5;
+      let renderW = boxW;
+      let renderH = boxH;
+
+      if (aspect > boxW / boxH) {
+        renderW = boxW;
+        renderH = boxW / aspect;
+      } else {
+        renderH = boxH;
+        renderW = boxH * aspect;
+      }
+
+      const renderX = boxX + (boxW - renderW) / 2;
+      const renderY = boxY + (boxH - renderH) / 2;
+
+      doc.addImage(logoImage.dataUrl, logoImage.format, renderX, renderY, renderW, renderH);
+
+      textStartX = originX + 22.0;
+    } catch {
+      textStartX = originX + 3.2;
     }
   }
 
-  // Render Event Logo (placed in header or right before stub)
-  let headerRightMargin = originX + 58.0;
+  // B. RENDER EVENT LOGO IN STUB HEADER (Logomarca do Evento)
+  // Positioned in the header above the access control stub (x = originX + 59 to originX + 89 mm)
+  const stubHeaderCenterX = originX + 74.0;
   if (logoImage) {
     try {
-      const logoBoxW = 13.5;
-      const logoBoxH = 11.5;
-      const logoX = originX + 59.0 - logoBoxW - 1.5;
-      const logoY = headerY + 1.35;
+      const maxLogoW = 24.0;
+      const maxLogoH = 11.5;
+      const aspect = logoImage.aspectRatio || 2.0;
 
-      // Clean background pill for logo if dark
+      let renderW = maxLogoW;
+      let renderH = maxLogoH;
+
+      if (aspect > maxLogoW / maxLogoH) {
+        renderW = maxLogoW;
+        renderH = maxLogoW / aspect;
+      } else {
+        renderH = maxLogoH;
+        renderW = maxLogoH * aspect;
+      }
+
+      const renderX = stubHeaderCenterX - renderW / 2;
+      const renderY = headerY + (headerH - renderH) / 2;
+
+      // Clean contrast container backdrop
       doc.setFillColor(15, 23, 42);
-      doc.roundedRect(logoX - 0.5, logoY - 0.5, logoBoxW + 1.0, logoBoxH + 1.0, 0.6, 0.6, 'F');
+      doc.roundedRect(renderX - 0.4, renderY - 0.4, renderW + 0.8, renderH + 0.8, 0.5, 0.5, 'F');
 
-      doc.addImage(logoImage.dataUrl, logoImage.format, logoX, logoY, logoBoxW, logoBoxH);
-
-      headerRightMargin = logoX - 1.5;
-    } catch {
-      headerRightMargin = originX + 58.0;
+      doc.addImage(logoImage.dataUrl, logoImage.format, renderX, renderY, renderW, renderH);
+    } catch (e) {
+      console.warn('Erro ao renderizar logo no cabeçalho do canhoto:', e);
     }
+  } else {
+    // Official typography badge when no logo is uploaded
+    doc.setTextColor(255, 255, 255);
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(6.2);
+    doc.text('INGRESSO', stubHeaderCenterX, headerY + 5.8, { align: 'center' });
+
+    doc.setFontSize(5.0);
+    doc.setTextColor(56, 189, 248); // Sky blue
+    doc.text('AUTENTICADO', stubHeaderCenterX, headerY + 10.2, { align: 'center' });
   }
+
+  // C. EVENT METADATA (Left Header Body)
+  const headerRightMargin = originX + 58.0;
 
   // Event Name (Bold white)
   doc.setTextColor(255, 255, 255);
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(7.6);
 
-  const availableTitleChars = Math.max(16, Math.floor((headerRightMargin - textStartX) * 1.6));
+  const availableTitleChars = Math.max(16, Math.floor((headerRightMargin - textStartX) * 1.55));
   const rawEventName = (event.name || ticket.eventName || 'EVENTO').toUpperCase();
   const truncatedEventName = rawEventName.length > availableTitleChars
     ? rawEventName.slice(0, availableTitleChars - 2) + '...'
     : rawEventName;
-  doc.text(truncatedEventName, textStartX, headerY + 4.4);
+  doc.text(truncatedEventName, textStartX, headerY + 4.5);
 
   // Date and Time (Sky Blue / High contrast)
   doc.setFont('helvetica', 'bold');
@@ -246,20 +428,20 @@ export function renderTicket(
   const formattedDate = event.date ? event.date.split('-').reverse().join('/') : '';
   const dateStr = formattedDate ? `DATA: ${formattedDate}` : 'DATA A DEFINIR';
   const timeStr = event.startTime ? `ÀS ${event.startTime}` : '';
-  doc.text(`${dateStr} ${timeStr}`.trim(), textStartX, headerY + 8.3);
+  doc.text(`${dateStr} ${timeStr}`.trim(), textStartX, headerY + 8.5);
 
-  // Venue & City (Soft light gray)
+  // Venue & City (Soft light slate)
   doc.setFont('helvetica', 'normal');
   doc.setFontSize(5.0);
   doc.setTextColor(203, 213, 225); // slate-300
   const venueStr = (event.venue || event.address || 'Portaria Principal').toUpperCase();
   const cityStr = event.city ? `• ${event.city.toUpperCase()}` : '';
   const fullVenue = `${venueStr} ${cityStr}`.trim();
-  const availableVenueChars = Math.max(18, Math.floor((headerRightMargin - textStartX) * 2.0));
+  const availableVenueChars = Math.max(18, Math.floor((headerRightMargin - textStartX) * 1.95));
   const truncatedVenue = fullVenue.length > availableVenueChars
     ? fullVenue.slice(0, availableVenueChars - 2) + '...'
     : fullVenue;
-  doc.text(truncatedVenue, textStartX, headerY + 12.0);
+  doc.text(truncatedVenue, textStartX, headerY + 12.2);
 
   // --- 3. PERFORATION DIVIDER & NOTCHES (x = originX + 59 mm) ---
   const stubDividerX = originX + 59.0;
@@ -269,7 +451,7 @@ export function renderTicket(
   doc.circle(stubDividerX, headerY + headerH, 1.2, 'F');
   doc.circle(stubDividerX, originY + 48.8, 1.2, 'F');
 
-  // Perforated line
+  // Perforated dashed line
   doc.setDrawColor(203, 213, 225); // slate-300
   doc.setLineWidth(0.25);
   doc.setLineDashPattern([1.2, 0.8], 0);
@@ -346,15 +528,19 @@ export function renderTicket(
   doc.text('Válido p/ 1 entrada única • Apresente na portaria • Proibida reprodução', originX + 3.0, originY + 47.8);
 
   // --- 5. TICKET STUB: RIGHT COLUMN (x = originX + 59 to 89 mm, width = 30 mm) ---
-  // Stub Header
+  // A dedicated pure white container guarantees 100% optical reading of the QR Code
+  doc.setFillColor(255, 255, 255);
+  doc.rect(originX + 59.2, originY + 15.5, 29.8, 33.5, 'F');
+
+  // Stub Sub-header
   doc.setTextColor(100, 116, 139);
   doc.setFont('helvetica', 'bold');
-  doc.setFontSize(4.5);
-  doc.text('CONTROLE DE ACESSO', originX + 74.0, originY + 17.6, { align: 'center' });
+  doc.setFontSize(4.6);
+  doc.text('CONTROLE DE ACESSO', originX + 74.0, originY + 18.2, { align: 'center' });
 
-  // High Resolution QR Code Image (22.5 mm x 22.5 mm, centered on stub)
+  // High Resolution QR Code Image (22.5 mm x 22.5 mm, centered with generous white quiet zones)
   const qrX = originX + 62.75;
-  const qrY = originY + 19.0;
+  const qrY = originY + 19.5;
   const qrSize = 22.5;
   try {
     doc.addImage(qrDataUrl, 'PNG', qrX, qrY, qrSize, qrSize);
@@ -367,7 +553,7 @@ export function renderTicket(
   doc.setFont('courier', 'bold');
   doc.setFontSize(6.2);
   const codeText = ticket.ticketNumber || ticket.id;
-  doc.text(codeText, originX + 74.0, originY + 44.2, { align: 'center' });
+  doc.text(codeText, originX + 74.0, originY + 44.5, { align: 'center' });
 
   // Security Hash verification string (Last 8 chars)
   doc.setTextColor(100, 116, 139);
@@ -375,12 +561,13 @@ export function renderTicket(
   doc.setFontSize(4.3);
   const tokenClean = ticket.validationToken || '';
   const tokenHash = tokenClean.length > 8 ? tokenClean.slice(-8).toUpperCase() : tokenClean.toUpperCase() || 'VALID';
-  doc.text(`HASH: #${tokenHash}`, originX + 74.0, originY + 47.4, { align: 'center' });
+  doc.text(`HASH: #${tokenHash}`, originX + 74.0, originY + 47.8, { align: 'center' });
 }
 
 /**
  * Creates and compiles a jsPDF document containing the given tickets formatted for
  * OPTIMIZED A4 PRINTING (12 tickets per sheet, 90mm x 50mm each, landscape orientation).
+ * Automatically resolves cover and logo from the database if not present in the passed event.
  */
 export async function generateA4TicketsPDFDocument(
   tickets: Ticket[],
@@ -391,6 +578,9 @@ export async function generateA4TicketsPDFDocument(
   if (!tickets || tickets.length === 0) {
     throw new Error('Nenhum ingresso fornecido para geração do PDF A4.');
   }
+
+  // Ensure full event with database images is retrieved
+  const fullEvent = await resolveEventFromDatabase(event, tickets[0]?.eventId);
 
   const layout = calculateA4Layout();
 
@@ -403,8 +593,8 @@ export async function generateA4TicketsPDFDocument(
 
   // Pre-load event cover and logo images once for ultra-fast rendering
   const [coverImage, logoImage] = await Promise.all([
-    getCleanImageDataUrl(event.coverImage || batch?.artworkUrl),
-    getCleanImageDataUrl(event.logoImage)
+    getCleanImageDataUrl(fullEvent.coverImage || batch?.artworkUrl),
+    getCleanImageDataUrl(fullEvent.logoImage)
   ]);
 
   const totalTickets = tickets.length;
@@ -421,7 +611,7 @@ export async function generateA4TicketsPDFDocument(
     doc.setFont('helvetica', 'normal');
     doc.setFontSize(6.5);
     doc.setTextColor(148, 163, 184); // slate-400
-    const printInfo = `${(event.name || 'EVENTO').toUpperCase()} • LOTE: ${(batch?.name || tickets[0]?.batchName || 'GERAL').toUpperCase()} • PÁGINA ${pageIndex + 1} DE ${totalPages} • FORMATO 90x50 MM (12 INGRESSOS/FOLHA A4)`;
+    const printInfo = `${(fullEvent.name || 'EVENTO').toUpperCase()} • LOTE: ${(batch?.name || tickets[0]?.batchName || 'GERAL').toUpperCase()} • PÁGINA ${pageIndex + 1} DE ${totalPages} • FORMATO 90x50 MM (12 INGRESSOS/FOLHA A4)`;
     doc.text(printInfo, layout.pageWidth / 2, 3.8, { align: 'center' });
 
     // Render tickets on this page (up to 12)
@@ -444,7 +634,7 @@ export async function generateA4TicketsPDFDocument(
       renderTicket(
         doc,
         ticket,
-        event,
+        fullEvent,
         batch,
         qrDataUrl,
         coverImage,
@@ -462,6 +652,7 @@ export async function generateA4TicketsPDFDocument(
 /**
  * Creates and compiles a jsPDF document containing the given tickets in STANDALONE 90mm x 50mm format.
  * (1 ticket per page, exactly 9cm x 5cm).
+ * Automatically resolves cover and logo from the database if not present in the passed event.
  */
 export async function generateTicketsPDFDocument(
   tickets: Ticket[],
@@ -473,6 +664,9 @@ export async function generateTicketsPDFDocument(
     throw new Error('Nenhum ingresso fornecido para geração de PDF.');
   }
 
+  // Ensure full event with database images is retrieved
+  const fullEvent = await resolveEventFromDatabase(event, tickets[0]?.eventId);
+
   // Exact required physical dimensions: 90 mm x 50 mm (9cm x 5cm)
   const doc = new jsPDF({
     orientation: 'landscape',
@@ -482,8 +676,8 @@ export async function generateTicketsPDFDocument(
 
   // Pre-load event cover and logo images once for ultra-fast rendering
   const [coverImage, logoImage] = await Promise.all([
-    getCleanImageDataUrl(event.coverImage || batch?.artworkUrl),
-    getCleanImageDataUrl(event.logoImage)
+    getCleanImageDataUrl(fullEvent.coverImage || batch?.artworkUrl),
+    getCleanImageDataUrl(fullEvent.logoImage)
   ]);
 
   const total = tickets.length;
@@ -499,7 +693,7 @@ export async function generateTicketsPDFDocument(
     // Generate unique QR code for this ticket
     const qrDataUrl = await generateQrDataUrl(ticket.validationToken || ticket.ticketNumber);
 
-    renderTicket(doc, ticket, event, batch, qrDataUrl, coverImage, logoImage, 0, 0, false);
+    renderTicket(doc, ticket, fullEvent, batch, qrDataUrl, coverImage, logoImage, 0, 0, false);
   }
 
   return doc;
@@ -540,9 +734,10 @@ export async function exportTicketsBatchToA4PDF(
   batch?: TicketBatch,
   onProgress?: (current: number, total: number) => void
 ): Promise<void> {
-  const doc = await generateA4TicketsPDFDocument(tickets, event, batch, onProgress);
+  const fullEvent = await resolveEventFromDatabase(event, tickets[0]?.eventId);
+  const doc = await generateA4TicketsPDFDocument(tickets, fullEvent, batch, onProgress);
 
-  const cleanEventName = (event.name || 'evento').replace(/[^a-zA-Z0-9]/g, '_');
+  const cleanEventName = (fullEvent.name || 'evento').replace(/[^a-zA-Z0-9]/g, '_');
   const cleanBatchName = (batch?.name || tickets[0]?.batchName || 'lote').replace(/[^a-zA-Z0-9]/g, '_');
   const filename = `Ingressos_Folha_A4_${cleanEventName}_${cleanBatchName}_${tickets.length}un.pdf`;
 
@@ -559,9 +754,10 @@ export async function exportTicketsBatchToPDF(
   batch?: TicketBatch,
   onProgress?: (current: number, total: number) => void
 ): Promise<void> {
-  const doc = await generateTicketsPDFDocument(tickets, event, batch, onProgress);
+  const fullEvent = await resolveEventFromDatabase(event, tickets[0]?.eventId);
+  const doc = await generateTicketsPDFDocument(tickets, fullEvent, batch, onProgress);
 
-  const cleanEventName = (event.name || 'evento').replace(/[^a-zA-Z0-9]/g, '_');
+  const cleanEventName = (fullEvent.name || 'evento').replace(/[^a-zA-Z0-9]/g, '_');
   const cleanBatchName = (batch?.name || tickets[0]?.batchName || 'lote').replace(/[^a-zA-Z0-9]/g, '_');
   const filename = `Ingressos_9x5cm_${cleanEventName}_${cleanBatchName}_${tickets.length}un.pdf`;
 
@@ -577,9 +773,10 @@ export async function exportSingleTicketToPDF(
   event: Event,
   batch?: TicketBatch
 ): Promise<void> {
-  const doc = await generateTicketsPDFDocument([ticket], event, batch);
+  const fullEvent = await resolveEventFromDatabase(event, ticket.eventId);
+  const doc = await generateTicketsPDFDocument([ticket], fullEvent, batch);
 
-  const cleanEventName = (event.name || 'evento').replace(/[^a-zA-Z0-9]/g, '_');
+  const cleanEventName = (fullEvent.name || 'evento').replace(/[^a-zA-Z0-9]/g, '_');
   const cleanCode = (ticket.ticketNumber || ticket.id).replace(/[^a-zA-Z0-9]/g, '_');
   const filename = `Ingresso_9x5cm_${cleanEventName}_${cleanCode}.pdf`;
 
