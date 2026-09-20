@@ -16,7 +16,8 @@ import {
   Volume2,
   VolumeX,
   Cloud,
-  Loader2
+  Loader2,
+  Zap
 } from 'lucide-react';
 import { User, ValidationResult, Event } from '../types';
 import { StorageService } from '../services/storage';
@@ -41,6 +42,7 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
   const [selectedEventId, setSelectedEventId] = useState<string>('all');
   const [manualCode, setManualCode] = useState<string>('');
   const [isScanning, setIsScanning] = useState<boolean>(false);
+  const [continuousMode, setContinuousMode] = useState<boolean>(true);
   const [cameraError, setCameraError] = useState<string>('');
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   const [isValidating, setIsValidating] = useState<boolean>(false);
@@ -70,8 +72,40 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const animFrameRef = useRef<number | null>(null);
+  const isPausedDecodingRef = useRef<boolean>(false);
+  const lastProcessedCodeRef = useRef<{ code: string; time: number }>({ code: '', time: 0 });
+  const nextScanTimerRef = useRef<NodeJS.Timeout | null>(null);
 
   const currentEvent = allEvents.find(e => e.id === selectedEventId);
+
+  // Helper date and time formatters for validation
+  const formatUtilizedDate = (isoString?: string) => {
+    if (!isoString) return '--/--/----';
+    try {
+      const d = new Date(isoString);
+      if (isNaN(d.getTime())) return isoString;
+      const day = d.getDate().toString().padStart(2, '0');
+      const month = (d.getMonth() + 1).toString().padStart(2, '0');
+      const year = d.getFullYear();
+      return `${day}/${month}/${year}`;
+    } catch {
+      return isoString;
+    }
+  };
+
+  const formatUtilizedTime = (isoString?: string) => {
+    if (!isoString) return '--:--:--';
+    try {
+      const d = new Date(isoString);
+      if (isNaN(d.getTime())) return isoString;
+      const hours = d.getHours().toString().padStart(2, '0');
+      const minutes = d.getMinutes().toString().padStart(2, '0');
+      const seconds = d.getSeconds().toString().padStart(2, '0');
+      return `${hours}:${minutes}:${seconds}`;
+    } catch {
+      return isoString;
+    }
+  };
 
   // Audio effects using Web Audio API
   const playFeedbackSound = (type: 'success' | 'error' | 'warning') => {
@@ -113,10 +147,15 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
     }
   };
 
-  // Start Camera
+  // Start Camera - keep continuous stream alive
   const startCamera = async () => {
+    if (nextScanTimerRef.current) {
+      clearTimeout(nextScanTimerRef.current);
+      nextScanTimerRef.current = null;
+    }
     setCameraError('');
     setIsScanning(true);
+    isPausedDecodingRef.current = false;
     setValidationResult(null);
     setConfirmedSuccess(false);
 
@@ -140,6 +179,11 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
 
   // Stop Camera
   const stopCamera = () => {
+    if (nextScanTimerRef.current) {
+      clearTimeout(nextScanTimerRef.current);
+      nextScanTimerRef.current = null;
+    }
+    isPausedDecodingRef.current = false;
     if (animFrameRef.current) {
       cancelAnimationFrame(animFrameRef.current);
       animFrameRef.current = null;
@@ -151,12 +195,12 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
     setIsScanning(false);
   };
 
-  // Continuous QR Code detection via canvas
+  // High-performance QR Code detection via canvas without stopping stream
   const tickScanner = () => {
     if (videoRef.current && videoRef.current.readyState === videoRef.current.HAVE_ENOUGH_DATA) {
       const video = videoRef.current;
       const canvas = canvasRef.current;
-      if (canvas) {
+      if (canvas && !isPausedDecodingRef.current) {
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
         const ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -167,10 +211,17 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
             inversionAttempts: 'dontInvert'
           });
 
-          if (code && code.data) {
-            stopCamera();
-            handleProcessCode(code.data);
-            return;
+          if (code && code.data && code.data.trim()) {
+            const rawData = code.data.trim();
+            const now = Date.now();
+            // Prevent immediate repeated scanning of the exact same code within 2.5s
+            if (rawData === lastProcessedCodeRef.current.code && now - lastProcessedCodeRef.current.time < 2500) {
+              // Wait before re-reading identical code
+            } else {
+              lastProcessedCodeRef.current = { code: rawData, time: now };
+              isPausedDecodingRef.current = true;
+              handleProcessCode(rawData);
+            }
           }
         }
       }
@@ -186,10 +237,19 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
 
   const handleProcessCode = async (codeStr: string) => {
     const clean = codeStr.trim();
-    if (!clean) return;
+    if (!clean) {
+      isPausedDecodingRef.current = false;
+      return;
+    }
+
+    if (nextScanTimerRef.current) {
+      clearTimeout(nextScanTimerRef.current);
+      nextScanTimerRef.current = null;
+    }
 
     setConfirmedSuccess(false);
     setIsValidating(true);
+
     try {
       const res = await StorageService.validateTicketAsync(
         clean,
@@ -198,8 +258,9 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
       );
       setValidationResult(res);
 
-      // Audio feedback
+      // Audio feedback & state
       if (res.status === 'VALID') {
+        setConfirmedSuccess(true);
         playFeedbackSound('success');
       } else if (res.status === 'ALREADY_USED') {
         playFeedbackSound('warning');
@@ -219,6 +280,19 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
         },
         ...prev.slice(0, 9)
       ]);
+
+      // If continuous mode is enabled and camera is scanning:
+      // Automatically reset result after 1.5s so the next ticket can be read immediately with zero friction
+      if (continuousMode && streamRef.current) {
+        nextScanTimerRef.current = setTimeout(() => {
+          setValidationResult(null);
+          setConfirmedSuccess(false);
+          isPausedDecodingRef.current = false;
+        }, 1500);
+      }
+    } catch (err) {
+      console.error('Validation error:', err);
+      isPausedDecodingRef.current = false;
     } finally {
       setIsValidating(false);
     }
@@ -235,10 +309,19 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
   };
 
   const handleNextScan = () => {
+    if (nextScanTimerRef.current) {
+      clearTimeout(nextScanTimerRef.current);
+      nextScanTimerRef.current = null;
+    }
     setValidationResult(null);
     setConfirmedSuccess(false);
     setManualCode('');
-    startCamera();
+    isPausedDecodingRef.current = false;
+
+    // If camera stream is not running, start it
+    if (!streamRef.current || !isScanning) {
+      startCamera();
+    }
   };
 
   // Stats for the active event or all events
@@ -269,10 +352,24 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <button
+            type="button"
+            onClick={() => setContinuousMode(!continuousMode)}
+            className={`px-3 py-2 rounded-xl border text-xs font-bold flex items-center gap-1.5 transition-colors cursor-pointer ${
+              continuousMode
+                ? 'bg-emerald-50 border-emerald-300 text-emerald-800'
+                : 'bg-slate-100 border-slate-300 text-slate-600'
+            }`}
+            title="Leitura Contínua: lê QR codes sucessivos automaticamente com o menor intervalo possível"
+          >
+            <Zap className={`w-3.5 h-3.5 ${continuousMode ? 'text-emerald-600 fill-emerald-500' : 'text-slate-400'}`} />
+            <span>{continuousMode ? 'Modo Contínuo: LIGADO' : 'Modo Contínuo: DESLIGADO'}</span>
+          </button>
+
           <button
             onClick={() => setSoundEnabled(!soundEnabled)}
-            className={`p-2 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition-colors ${
+            className={`p-2 rounded-xl border text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer ${
               soundEnabled ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-slate-100 border-slate-300 text-slate-500'
             }`}
             title="Ativar/Desativar som do leitor"
@@ -540,19 +637,19 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
               </div>
             )}
 
-            {/* ALREADY USED ALERT matching requirement #13 */}
+            {/* ALREADY USED ALERT matching requirement */}
             {validationResult.status === 'ALREADY_USED' && (
               <div className="p-6 rounded-2xl bg-amber-50 border-2 border-amber-500 space-y-4">
                 <div className="flex items-center gap-3 pb-4 border-b border-amber-200">
-                  <div className="w-12 h-12 rounded-full bg-amber-600 text-white flex items-center justify-center">
+                  <div className="w-12 h-12 rounded-full bg-amber-600 text-white flex items-center justify-center shrink-0">
                     <AlertTriangle className="w-7 h-7" />
                   </div>
                   <div>
                     <span className="text-xs uppercase font-extrabold tracking-wider text-amber-800">
                       Alerta de Fraude / Duplicidade
                     </span>
-                    <h3 className="text-xl font-black text-amber-950">
-                      ⚠️ INGRESSO JÁ UTILIZADO
+                    <h3 className="text-xl sm:text-2xl font-black text-amber-950">
+                      ⚠️ VOUCHER JÁ UTILIZADO
                     </h3>
                   </div>
                 </div>
@@ -570,33 +667,41 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
 
                   <div>
                     <span className="text-xs text-slate-500 font-medium">Evento:</span>
-                    <p className="font-semibold text-slate-800">{validationResult.event?.name}</p>
+                    <p className="font-semibold text-slate-800">{validationResult.event?.name || currentEvent?.name}</p>
                   </div>
 
-                  <div className="p-3 bg-amber-100 rounded-xl border border-amber-300">
-                    <span className="text-xs text-amber-900 font-bold block">Horário do Primeiro Check-in:</span>
-                    <p className="text-sm font-mono font-black text-amber-950">
-                      {validationResult.firstUsedAt
-                        ? new Date(validationResult.firstUsedAt).toLocaleString('pt-BR')
-                        : 'Já validado anteriormente'}
-                    </p>
+                  <div className="p-4 bg-amber-100/90 rounded-xl border-2 border-amber-400 space-y-1.5">
+                    <span className="text-xs uppercase font-extrabold tracking-wider text-amber-900 block">
+                      Utilizado em:
+                    </span>
+                    <div className="flex flex-col sm:flex-row sm:items-baseline gap-1 sm:gap-4 font-mono font-black text-amber-950">
+                      <span className="text-xl">
+                        {formatUtilizedDate(validationResult.firstUsedAt)}
+                      </span>
+                      <span className="text-xl text-amber-900">
+                        {formatUtilizedTime(validationResult.firstUsedAt)}
+                      </span>
+                    </div>
                     {validationResult.firstUsedByName && (
-                      <p className="text-xs text-amber-800 mt-0.5">Operador: {validationResult.firstUsedByName}</p>
+                      <p className="text-xs text-amber-800 font-semibold pt-1 border-t border-amber-300">
+                        Operador: {validationResult.firstUsedByName}
+                      </p>
                     )}
                   </div>
                 </div>
 
                 <div className="p-3 bg-rose-100 border border-rose-300 rounded-xl text-xs text-rose-900 font-bold text-center">
-                  ENTRADA NÃO PERMITIDA — Este código já teve entrada liberada e não pode ser reutilizado.
+                  ENTRADA NÃO PERMITIDA — Este voucher já teve entrada liberada e não pode ser reutilizado.
                 </div>
 
-                <div className="pt-2 text-center">
+                <div className="pt-2 text-center flex items-center justify-center gap-3">
                   <button
                     type="button"
                     onClick={handleNextScan}
-                    className="py-3 px-8 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-sm transition-all cursor-pointer"
+                    className="py-3 px-8 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold text-sm transition-all cursor-pointer flex items-center gap-2"
                   >
-                    Escanear Próximo
+                    <Camera className="w-4 h-4" />
+                    <span>Escanear Próximo</span>
                   </button>
                 </div>
               </div>

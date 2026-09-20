@@ -30,6 +30,7 @@ import {
   saveBatchToFirestore,
   findTicketInFirestore,
   validateTicketWithFirestore,
+  validateAndCheckInTicketAtomicWithFirestore,
   confirmCheckInWithFirestore,
   subscribeToTickets,
   subscribeToSales,
@@ -1364,6 +1365,122 @@ export const StorageService = {
     };
   },
 
+  // Local atomic check-in used when offline
+  validateAndCheckInLocalAtomic(
+    clean: string,
+    targetEventId?: string,
+    operator?: User
+  ): ValidationResult {
+    const tickets = getItem<Ticket[]>(STORAGE_KEYS.TICKETS, INITIAL_TICKETS);
+    const ticket = tickets.find(
+      t =>
+        t.validationToken.toUpperCase().replace(/[\u2010-\u2015\u2212]/g, '-') === clean ||
+        t.ticketNumber.toUpperCase().replace(/[\u2010-\u2015\u2212]/g, '-') === clean ||
+        t.id === clean
+    );
+
+    if (!ticket) {
+      return {
+        valid: false,
+        status: 'INVALID',
+        message: 'Código de ingresso não localizado no banco de dados.',
+        source: 'LOCAL',
+        tokenUnique: false,
+        scannedCode: clean,
+        checkedAt: new Date().toISOString()
+      };
+    }
+
+    const event = this.getEventById(ticket.eventId);
+
+    if (targetEventId && targetEventId !== 'all' && targetEventId !== '' && ticket.eventId !== targetEventId) {
+      return {
+        valid: false,
+        status: 'EVENT_MISMATCH',
+        message: `Este ingresso pertence ao evento "${event?.name || 'outro evento'}" e não ao evento selecionado na portaria.`,
+        ticket,
+        event,
+        source: 'LOCAL',
+        tokenUnique: true,
+        scannedCode: clean,
+        checkedAt: new Date().toISOString()
+      };
+    }
+
+    if (ticket.status === 'cancelled') {
+      return {
+        valid: false,
+        status: 'CANCELLED',
+        message: `Ingresso cancelado no sistema. ${ticket.notes ? `Motivo: ${ticket.notes}` : ''}`,
+        ticket,
+        event,
+        source: 'LOCAL',
+        tokenUnique: true,
+        scannedCode: clean,
+        checkedAt: new Date().toISOString()
+      };
+    }
+
+    if (ticket.status === 'blocked') {
+      return {
+        valid: false,
+        status: 'BLOCKED',
+        message: 'Ingresso bloqueado preventivamente pela administração.',
+        ticket,
+        event,
+        source: 'LOCAL',
+        tokenUnique: true,
+        scannedCode: clean,
+        checkedAt: new Date().toISOString()
+      };
+    }
+
+    // REQUIREMENT #4 & #5: If already used, return immediately with original timestamp, NEVER overwrite!
+    if (ticket.status === 'used') {
+      return {
+        valid: false,
+        status: 'ALREADY_USED',
+        message: 'VOUCHER JÁ UTILIZADO',
+        ticket,
+        event,
+        firstUsedAt: ticket.usedAt,
+        firstUsedByName: ticket.usedByUserName,
+        source: 'LOCAL',
+        tokenUnique: true,
+        scannedCode: clean,
+        checkedAt: new Date().toISOString()
+      };
+    }
+
+    // REQUIREMENT #3 & #5: First use - register immediately in database with exact timestamp!
+    const nowIso = new Date().toISOString();
+    ticket.status = 'used';
+    ticket.usedAt = nowIso;
+    ticket.usedByUserId = operator?.id || 'portaria';
+    ticket.usedByUserName = operator?.name || 'Portaria';
+    setItem(STORAGE_KEYS.TICKETS, tickets);
+    updateTicketStatusInFirestore(ticket.id, {
+      status: 'used',
+      usedAt: nowIso,
+      usedByUserId: operator?.id,
+      usedByUserName: operator?.name
+    });
+
+    return {
+      valid: true,
+      status: 'VALID',
+      message: 'ENTRADA LIBERADA ✓',
+      ticket,
+      event,
+      firstUsedAt: nowIso,
+      firstUsedByName: operator?.name || 'Portaria',
+      source: 'LOCAL',
+      tokenUnique: true,
+      scannedCode: clean,
+      checkedAt: nowIso
+    };
+  },
+
   async validateTicketAsync(
     tokenOrNumber: string,
     targetEventId?: string,
@@ -1372,11 +1489,10 @@ export const StorageService = {
     const clean = this.normalizeScannedCode(tokenOrNumber);
 
     try {
-      // 1. Authoritative check against Cloud Firestore for existence, status, token uniqueness, and company isolation
-      const operatorCompanyId = operator?.role === 'MASTER' ? undefined : operator?.companyId;
-      const firestoreResult = await validateTicketWithFirestore(clean, targetEventId, operatorCompanyId);
+      // 1. Authoritative ATOMIC validation & check-in in Cloud Firestore
+      const firestoreResult = await validateAndCheckInTicketAtomicWithFirestore(clean, targetEventId, operator);
 
-      // If ticket found in Firestore, sync/update local cache
+      // If ticket found in Firestore, sync/update local cache immediately
       if (firestoreResult.ticket) {
         const tickets = getItem<Ticket[]>(STORAGE_KEYS.TICKETS, INITIAL_TICKETS);
         const idx = tickets.findIndex(t => t.id === firestoreResult.ticket!.id);
@@ -1396,7 +1512,16 @@ export const StorageService = {
           operator.name,
           operator.role,
           'Tentativa Ingresso Duplicado (Firestore)',
-          `ALERTA DE FRAUDE: Tentativa de reuso do ingresso ${firestoreResult.ticket.ticketNumber} (${firestoreResult.ticket.customerName}). Primeiro check-in foi às ${firestoreResult.firstUsedAt ? new Date(firestoreResult.firstUsedAt).toLocaleTimeString('pt-BR') : 'horário registrado'}.`
+          `ALERTA DE FRAUDE: Tentativa de reuso do ingresso ${firestoreResult.ticket.ticketNumber} (${firestoreResult.ticket.customerName}). Primeiro check-in registrado em: ${firestoreResult.firstUsedAt ? new Date(firestoreResult.firstUsedAt).toLocaleString('pt-BR') : 'horário registrado'}.`
+        );
+      } else if (firestoreResult.status === 'VALID' && operator && firestoreResult.ticket) {
+        this.addAuditLog(
+          firestoreResult.ticket.companyId,
+          operator.id,
+          operator.name,
+          operator.role,
+          'Check-in Confirmado (Firestore)',
+          `Entrada liberada para ${firestoreResult.ticket.customerName} (${firestoreResult.ticket.ticketTypeName} - Nº ${firestoreResult.ticket.ticketNumber}) com sucesso.`
         );
       } else if (firestoreResult.status === 'NON_UNIQUE' && operator) {
         this.addAuditLog(
@@ -1411,15 +1536,8 @@ export const StorageService = {
 
       return firestoreResult;
     } catch (err) {
-      console.warn('Firestore live validation failed, using local cache fallback:', err);
-      // Fallback to local storage validation if Firestore network request fails
-      const localResult = this.validateTicket(clean, targetEventId, operator);
-      return {
-        ...localResult,
-        source: 'LOCAL',
-        tokenUnique: localResult.valid,
-        scannedCode: clean
-      };
+      console.warn('Firestore live validation failed, using local cache atomic fallback:', err);
+      return this.validateAndCheckInLocalAtomic(clean, targetEventId, operator);
     }
   },
 

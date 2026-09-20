@@ -52,6 +52,7 @@ export const TicketDisplayModal: React.FC<TicketDisplayModalProps> = ({
   const [hasPrinted, setHasPrinted] = useState<boolean>(false);
   const [printAll, setPrintAll] = useState<boolean>(false);
   const [showPrintConfirmDialog, setShowPrintConfirmDialog] = useState<boolean>(false);
+  const [pendingPrintAll, setPendingPrintAll] = useState<boolean>(false);
 
   const currentTicket = tickets[currentIndex] || tickets[0];
   const printRef = useRef<HTMLDivElement>(null);
@@ -117,8 +118,16 @@ export const TicketDisplayModal: React.FC<TicketDisplayModalProps> = ({
     }
   };
 
-  const handlePrint = (all: boolean = false) => {
+  // Request print: Intercepts print command with confirmation modal to prevent accidental jobs
+  const requestPrint = (all: boolean = false) => {
+    setPendingPrintAll(all);
+    setShowPrintConfirmDialog(true);
+  };
+
+  // Execute print after confirmation
+  const executePrint = (all: boolean = false) => {
     setPrintAll(all);
+    setShowPrintConfirmDialog(false);
     const now = new Date();
     const timeStr = now.toLocaleTimeString('pt-BR', {
       hour: '2-digit',
@@ -135,7 +144,6 @@ export const TicketDisplayModal: React.FC<TicketDisplayModalProps> = ({
       count: all ? tickets.length : 1
     });
     setHasPrinted(true);
-    setShowPrintConfirmDialog(false);
 
     // Notify POSView operator interface
     onPrintSuccess?.({
@@ -174,12 +182,15 @@ export const TicketDisplayModal: React.FC<TicketDisplayModalProps> = ({
       } catch (err) {
         console.error('Erro ao acionar serviço de impressão:', err);
       } finally {
-        // Automatically close modal overlay once print service has been triggered
         setTimeout(() => {
           triggerAutoClose();
         }, 150);
       }
-    }, 80);
+    }, 100);
+  };
+
+  const handlePrint = (all: boolean = false) => {
+    requestPrint(all);
   };
 
   const handleSendWhatsApp = () => {
@@ -526,6 +537,48 @@ export const TicketDisplayModal: React.FC<TicketDisplayModalProps> = ({
             </button>
           </div>
         </div>
+
+        {/* Confirmation Dialog to prevent accidental print jobs */}
+        {showPrintConfirmDialog && (
+          <div className="fixed inset-0 z-60 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+            <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-2xl border border-slate-200 text-center space-y-4 animate-in fade-in zoom-in-95 duration-150">
+              <div className="w-12 h-12 rounded-full bg-indigo-100 text-indigo-600 flex items-center justify-center mx-auto">
+                <Printer className="w-6 h-6" />
+              </div>
+              <div className="space-y-1.5">
+                <h3 className="text-base font-bold text-slate-900">
+                  Confirmar Impressão?
+                </h3>
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  {pendingPrintAll
+                    ? `Deseja realmente imprimir todos os ${tickets.length} ingressos desta venda?`
+                    : `Deseja realmente imprimir o ingresso ${currentTicket.ticketNumber} (${currentTicket.customerName})?`}
+                </p>
+                <p className="text-[11px] text-slate-400">
+                  Certifique-se de que a impressora térmica/padrão está ligada e pronta com papel.
+                </p>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2.5 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setShowPrintConfirmDialog(false)}
+                  className="w-full py-2.5 px-4 rounded-xl border border-slate-300 text-slate-700 font-semibold text-xs hover:bg-slate-100 transition-colors cursor-pointer"
+                >
+                  Cancelar
+                </button>
+                <button
+                  type="button"
+                  onClick={() => executePrint(pendingPrintAll)}
+                  className="w-full py-2.5 px-4 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs shadow-xs transition-all cursor-pointer flex items-center justify-center gap-1.5"
+                >
+                  <Printer className="w-3.5 h-3.5" />
+                  <span>Imprimir</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Printable Voucher Format (Shown only during print) */}

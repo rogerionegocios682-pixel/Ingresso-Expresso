@@ -2,6 +2,7 @@ import { initializeApp, getApps, getApp } from 'firebase/app';
 import {
   getFirestore,
   doc,
+  getDoc,
   getDocFromServer,
   collection,
   onSnapshot,
@@ -10,6 +11,7 @@ import {
   getDocs,
   query,
   where,
+  limit,
   runTransaction,
   writeBatch
 } from 'firebase/firestore';
@@ -132,30 +134,68 @@ export async function saveBatchToFirestore(batch: TicketBatch): Promise<void> {
   }
 }
 
-// Direct live lookup for a ticket in Firestore by token or number
+// Helper to normalize QR Code payloads and barcodes
+export function normalizeTicketCode(cleanCode: string): string {
+  let clean = (cleanCode || '').trim();
+  clean = clean.replace(/[\u200B-\u200D\uFEFF]/g, '');
+  clean = clean.replace(/[\u2010-\u2015\u2212]/g, '-');
+
+  if (clean.startsWith('{') && clean.endsWith('}')) {
+    try {
+      const parsed = JSON.parse(clean);
+      if (parsed.t) clean = parsed.t;
+      else if (parsed.validationToken) clean = parsed.validationToken;
+      else if (parsed.n) clean = parsed.n;
+      else if (parsed.ticketNumber) clean = parsed.ticketNumber;
+    } catch {
+      // fallback
+    }
+  }
+
+  if (clean.includes('?') && (clean.includes('token=') || clean.includes('t=') || clean.includes('code='))) {
+    try {
+      const url = new URL(clean);
+      const p = url.searchParams.get('token') || url.searchParams.get('t') || url.searchParams.get('code');
+      if (p) clean = p;
+    } catch {
+      // fallback
+    }
+  }
+
+  return clean.trim().toUpperCase().replace(/[\u2010-\u2015\u2212]/g, '-');
+}
+
+// Fast direct index lookup for a ticket in Firestore
 export async function findTicketInFirestore(cleanCode: string): Promise<Ticket | null> {
   try {
-    // Normalize code
-    const normalized = cleanCode.trim().toUpperCase().replace(/[\u2010-\u2015\u2212]/g, '-');
+    const normalized = normalizeTicketCode(cleanCode);
+    const colRef = collection(db, 'tickets');
 
-    // 1. Check by validationToken
-    const qToken = query(collection(db, 'tickets'), where('validationToken', '==', normalized));
-    const snapToken = await getDocs(qToken);
-    if (!snapToken.empty) {
-      return snapToken.docs[0].data() as Ticket;
+    // Fast path: if code starts with TKT- (tokens), query validationToken directly
+    if (normalized.startsWith('TKT-')) {
+      const qToken = query(colRef, where('validationToken', '==', normalized), limit(1));
+      const snap = await getDocs(qToken);
+      if (!snap.empty) return snap.docs[0].data() as Ticket;
     }
 
-    // 2. Check by ticketNumber
-    const qNum = query(collection(db, 'tickets'), where('ticketNumber', '==', normalized));
+    // Direct doc ID check
+    const directDoc = await getDoc(doc(db, 'tickets', cleanCode.trim()));
+    if (directDoc.exists()) {
+      return directDoc.data() as Ticket;
+    }
+
+    // Query ticketNumber
+    const qNum = query(colRef, where('ticketNumber', '==', normalized), limit(1));
     const snapNum = await getDocs(qNum);
     if (!snapNum.empty) {
       return snapNum.docs[0].data() as Ticket;
     }
 
-    // 3. Check by id
-    const docSnap = await getDocs(query(collection(db, 'tickets'), where('id', '==', cleanCode.trim())));
-    if (!docSnap.empty) {
-      return docSnap.docs[0].data() as Ticket;
+    // Query validationToken fallback
+    const qTokenFallback = query(colRef, where('validationToken', '==', normalized), limit(1));
+    const snapTokenFallback = await getDocs(qTokenFallback);
+    if (!snapTokenFallback.empty) {
+      return snapTokenFallback.docs[0].data() as Ticket;
     }
 
     return null;
@@ -165,39 +205,102 @@ export async function findTicketInFirestore(cleanCode: string): Promise<Ticket |
   }
 }
 
-// Live Firestore QR Code validation checking Existence, Status, Token Uniqueness, and Multi-company
-export async function validateTicketWithFirestore(
+/**
+ * ATOMIC Check-In & Validation in Cloud Firestore
+ *
+ * Implements strict requirements:
+ * 1. Rapid indexed query (QR CODE -> IDENTIFICATION -> FAST LOOKUP)
+ * 2. If voucher was ALREADY USED previously:
+ *    - Returns status 'ALREADY_USED' IMMEDIATELY without re-validating or writing
+ *    - Returns EXACT original date and time of first utilization (never overwrites!)
+ * 3. If voucher is valid and available:
+ *    - Atomically registers usage in Firestore inside a runTransaction
+ *    - Stores exact ISO timestamp and operator credentials
+ *    - Guarantees zero race conditions even if 2 devices scan simultaneously
+ */
+export async function validateAndCheckInTicketAtomicWithFirestore(
   cleanCode: string,
   targetEventId?: string,
-  operatorCompanyId?: string
+  operator?: User
 ): Promise<ValidationResult> {
-  const normalized = cleanCode.trim().toUpperCase().replace(/[\u2010-\u2015\u2212]/g, '-');
+  const normalized = normalizeTicketCode(cleanCode);
   const checkedAt = new Date().toISOString();
+  const operatorCompanyId = operator?.role === 'MASTER' ? undefined : operator?.companyId;
 
   try {
     const colRef = collection(db, 'tickets');
 
-    // 1. Query by validationToken
-    const qToken = query(colRef, where('validationToken', '==', normalized));
-    const snapToken = await getDocs(qToken);
-    let matchingDocs = snapToken.docs;
+    // 1. FAST INDEXED DISCOVERY (Direct doc, validationToken, or ticketNumber)
+    let matchingDocRef: ReturnType<typeof doc> | null = null;
+    let initialDocData: Ticket | null = null;
+    let matchCount = 0;
 
-    // 2. Query by ticketNumber if no token match
-    if (matchingDocs.length === 0) {
-      const qNum = query(colRef, where('ticketNumber', '==', normalized));
+    // Check direct doc id if pattern matches
+    if (cleanCode.startsWith('tkt-')) {
+      const snapDirect = await getDoc(doc(db, 'tickets', cleanCode.trim()));
+      if (snapDirect.exists()) {
+        matchingDocRef = snapDirect.ref;
+        initialDocData = snapDirect.data() as Ticket;
+        matchCount = 1;
+      }
+    }
+
+    // Check indexed validationToken
+    if (!matchingDocRef) {
+      const qToken = query(colRef, where('validationToken', '==', normalized), limit(2));
+      const snapToken = await getDocs(qToken);
+      if (!snapToken.empty) {
+        matchCount = snapToken.docs.length;
+        if (matchCount > 1) {
+          return {
+            valid: false,
+            status: 'NON_UNIQUE',
+            message: `ALERTA CRÍTICO: Token não é único! Foram localizados ${matchCount} ingressos com este token. Risco de clonagem.`,
+            tokenUnique: false,
+            checkedAt,
+            source: 'FIRESTORE',
+            scannedCode: cleanCode
+          };
+        }
+        matchingDocRef = snapToken.docs[0].ref;
+        initialDocData = snapToken.docs[0].data() as Ticket;
+      }
+    }
+
+    // Check indexed ticketNumber
+    if (!matchingDocRef) {
+      const qNum = query(colRef, where('ticketNumber', '==', normalized), limit(2));
       const snapNum = await getDocs(qNum);
-      matchingDocs = snapNum.docs;
+      if (!snapNum.empty) {
+        matchCount = snapNum.docs.length;
+        if (matchCount > 1) {
+          return {
+            valid: false,
+            status: 'NON_UNIQUE',
+            message: `ALERTA CRÍTICO: Número de ingresso duplicado no banco (${matchCount} registros).`,
+            tokenUnique: false,
+            checkedAt,
+            source: 'FIRESTORE',
+            scannedCode: cleanCode
+          };
+        }
+        matchingDocRef = snapNum.docs[0].ref;
+        initialDocData = snapNum.docs[0].data() as Ticket;
+      }
     }
 
-    // 3. Query by document id as fallback
-    if (matchingDocs.length === 0) {
-      const qId = query(colRef, where('id', '==', cleanCode.trim()));
+    // Check field 'id' fallback
+    if (!matchingDocRef) {
+      const qId = query(colRef, where('id', '==', cleanCode.trim()), limit(1));
       const snapId = await getDocs(qId);
-      matchingDocs = snapId.docs;
+      if (!snapId.empty) {
+        matchingDocRef = snapId.docs[0].ref;
+        initialDocData = snapId.docs[0].data() as Ticket;
+      }
     }
 
-    // 4. Verification 1: Existence
-    if (matchingDocs.length === 0) {
+    // If ticket was not found in Firestore
+    if (!matchingDocRef || !initialDocData) {
       return {
         valid: false,
         status: 'INVALID',
@@ -209,122 +312,143 @@ export async function validateTicketWithFirestore(
       };
     }
 
-    // 5. Verification 2: Token Uniqueness
-    // A legitimate QR code token must match exactly 1 document in the database
-    if (matchingDocs.length > 1) {
-      return {
-        valid: false,
-        status: 'NON_UNIQUE',
-        message: `ALERTA DE SEGURANÇA: Token não é único! Foram detectados ${matchingDocs.length} ingressos com este mesmo token no banco. Tentativa de clonagem ou duplicação.`,
-        tokenUnique: false,
-        checkedAt,
-        source: 'FIRESTORE',
-        scannedCode: cleanCode
-      };
-    }
-
-    const ticket = matchingDocs[0].data() as Ticket;
-
-    // Multi-company isolation check
-    if (operatorCompanyId && ticket.companyId && ticket.companyId !== operatorCompanyId) {
-      return {
-        valid: false,
-        status: 'INVALID',
-        message: 'Acesso negado: Este ingresso pertence a outra empresa/organizadora.',
-        tokenUnique: true,
-        checkedAt,
-        source: 'FIRESTORE',
-        scannedCode: cleanCode
-      };
-    }
-
-    // Fetch associated event details from Firestore if available
-    let event: Event | undefined;
-    try {
-      const eventsSnap = await getDocs(query(collection(db, 'events'), where('id', '==', ticket.eventId)));
-      if (!eventsSnap.empty) {
-        event = eventsSnap.docs[0].data() as Event;
+    // 2. ATOMIC TRANSACTION: Concurrency control against double-usage across devices
+    const txResult = await runTransaction(db, async (transaction) => {
+      const freshSnap = await transaction.get(matchingDocRef!);
+      if (!freshSnap.exists()) {
+        return {
+          valid: false,
+          status: 'INVALID' as const,
+          message: 'Ingresso removido do Firestore.',
+          tokenUnique: false,
+          checkedAt,
+          source: 'FIRESTORE' as const,
+          scannedCode: cleanCode
+        };
       }
-    } catch {
-      // ignore
-    }
 
-    // 6. Verification 3: Event Matching
-    if (targetEventId && targetEventId !== 'all' && targetEventId !== '' && ticket.eventId !== targetEventId) {
+      const ticket = freshSnap.data() as Ticket;
+
+      // Multi-company isolation
+      if (operatorCompanyId && ticket.companyId && ticket.companyId !== operatorCompanyId) {
+        return {
+          valid: false,
+          status: 'INVALID' as const,
+          message: 'Acesso negado: Este ingresso pertence a outra empresa/organizadora.',
+          ticket,
+          tokenUnique: true,
+          checkedAt,
+          source: 'FIRESTORE' as const,
+          scannedCode: cleanCode
+        };
+      }
+
+      // Event matching check
+      if (targetEventId && targetEventId !== 'all' && targetEventId !== '' && ticket.eventId !== targetEventId) {
+        return {
+          valid: false,
+          status: 'EVENT_MISMATCH' as const,
+          message: `Este ingresso pertence ao evento "${ticket.eventName || 'outro evento'}" e não ao evento selecionado na portaria.`,
+          ticket,
+          tokenUnique: true,
+          checkedAt,
+          source: 'FIRESTORE' as const,
+          scannedCode: cleanCode
+        };
+      }
+
+      // Cancelled check
+      if (ticket.status === 'cancelled') {
+        return {
+          valid: false,
+          status: 'CANCELLED' as const,
+          message: `Ingresso cancelado no sistema. ${ticket.notes || ticket.cancelReason ? `Motivo: ${ticket.notes || ticket.cancelReason}` : ''}`,
+          ticket,
+          tokenUnique: true,
+          checkedAt,
+          source: 'FIRESTORE' as const,
+          scannedCode: cleanCode
+        };
+      }
+
+      // Blocked check
+      if (ticket.status === 'blocked') {
+        return {
+          valid: false,
+          status: 'BLOCKED' as const,
+          message: 'Ingresso bloqueado preventivamente pela administração.',
+          ticket,
+          tokenUnique: true,
+          checkedAt,
+          source: 'FIRESTORE' as const,
+          scannedCode: cleanCode
+        };
+      }
+
+      // REQUIREMENT #4 & #5: VOUCHER JÁ UTILIZADO
+      // If already used, return IMMEDIATELY with the original date/time.
+      // Do NOT modify anything in the database! Do NOT overwrite usedAt!
+      if (ticket.status === 'used') {
+        return {
+          valid: false,
+          status: 'ALREADY_USED' as const,
+          message: 'VOUCHER JÁ UTILIZADO',
+          ticket,
+          firstUsedAt: ticket.usedAt,
+          firstUsedByName: ticket.usedByUserName,
+          tokenUnique: true,
+          checkedAt,
+          source: 'FIRESTORE' as const,
+          scannedCode: cleanCode
+        };
+      }
+
+      // REQUIREMENT #3 & #5: VOUCHER DISPONÍVEL (PRIMEIRO USO)
+      // Register usage IMMEDIATELY in the database with exact date and time.
+      const nowIso = new Date().toISOString();
+      const updates = {
+        status: 'used' as const,
+        usedAt: nowIso,
+        usedByUserId: operator?.id || 'portaria',
+        usedByUserName: operator?.name || 'Portaria'
+      };
+
+      // Atomic write within transaction
+      transaction.update(matchingDocRef!, updates);
+
       return {
-        valid: false,
-        status: 'EVENT_MISMATCH',
-        message: `Este ingresso pertence ao evento "${event?.name || ticket.eventName || 'outro evento'}" e não ao evento selecionado na portaria.`,
-        ticket,
-        event,
+        valid: true,
+        status: 'VALID' as const,
+        message: 'ENTRADA LIBERADA ✓',
+        ticket: { ...ticket, ...updates },
+        firstUsedAt: nowIso,
+        firstUsedByName: operator?.name || 'Portaria',
         tokenUnique: true,
-        checkedAt,
-        source: 'FIRESTORE',
+        checkedAt: nowIso,
+        source: 'FIRESTORE' as const,
         scannedCode: cleanCode
       };
-    }
+    });
 
-    // 7. Verification 4: Status (used, cancelled, blocked)
-    if (ticket.status === 'cancelled') {
-      return {
-        valid: false,
-        status: 'CANCELLED',
-        message: `Ingresso cancelado no sistema. ${ticket.notes || ticket.cancelReason ? `Motivo: ${ticket.notes || ticket.cancelReason}` : ''}`,
-        ticket,
-        event,
-        tokenUnique: true,
-        checkedAt,
-        source: 'FIRESTORE',
-        scannedCode: cleanCode
-      };
-    }
-
-    if (ticket.status === 'blocked') {
-      return {
-        valid: false,
-        status: 'BLOCKED',
-        message: 'Ingresso bloqueado preventivamente pela administração.',
-        ticket,
-        event,
-        tokenUnique: true,
-        checkedAt,
-        source: 'FIRESTORE',
-        scannedCode: cleanCode
-      };
-    }
-
-    if (ticket.status === 'used') {
-      return {
-        valid: false,
-        status: 'ALREADY_USED',
-        message: 'Atenção: Este ingresso JÁ FOI UTILIZADO e teve entrada liberada anteriormente.',
-        ticket,
-        event,
-        firstUsedAt: ticket.usedAt,
-        firstUsedByName: ticket.usedByUserName,
-        tokenUnique: true,
-        checkedAt,
-        source: 'FIRESTORE',
-        scannedCode: cleanCode
-      };
-    }
-
-    // Success: Valid, unique and confirmed
-    return {
-      valid: true,
-      status: 'VALID',
-      message: 'Ingresso válido, único e autenticado com sucesso no Firestore.',
-      ticket,
-      event,
-      tokenUnique: true,
-      checkedAt,
-      source: 'FIRESTORE',
-      scannedCode: cleanCode
-    };
+    return txResult;
   } catch (error) {
-    console.error('Error validating ticket with Firestore:', error);
+    console.error('Error in Firestore atomic validation:', error);
     throw error;
   }
+}
+
+// Live Firestore QR Code validation wrapper ensuring backwards compatibility
+export async function validateTicketWithFirestore(
+  cleanCode: string,
+  targetEventId?: string,
+  operatorCompanyId?: string,
+  operator?: User
+): Promise<ValidationResult> {
+  return validateAndCheckInTicketAtomicWithFirestore(
+    cleanCode,
+    targetEventId,
+    operator || (operatorCompanyId ? ({ companyId: operatorCompanyId, role: 'ADMIN', id: 'portaria', name: 'Portaria' } as User) : undefined)
+  );
 }
 
 // Atomic Check-In execution in Firestore using transactions

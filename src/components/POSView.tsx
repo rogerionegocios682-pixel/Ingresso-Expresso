@@ -14,7 +14,8 @@ import {
   Minus,
   ArrowRight,
   Sparkles,
-  Gift
+  Gift,
+  Printer
 } from 'lucide-react';
 import { Event, TicketBatch, PaymentMethod, User, Ticket } from '../types';
 import { StorageService } from '../services/storage';
@@ -66,6 +67,7 @@ export const POSView: React.FC<POSViewProps> = ({ currentUser }) => {
   // Custom toast notification state for printing confirmation
   const [printToast, setPrintToast] = useState<PrintToastData | null>(null);
   const [lastPrintJob, setLastPrintJob] = useState<PrintToastData | null>(null);
+  const [showReprintConfirm, setShowReprintConfirm] = useState<boolean>(false);
 
   const handlePrintSuccess = (info: {
     ticketLabel: string;
@@ -85,6 +87,11 @@ export const POSView: React.FC<POSViewProps> = ({ currentUser }) => {
   };
 
   const handleReprintFromToast = () => {
+    setShowReprintConfirm(true);
+  };
+
+  const executeReprint = () => {
+    setShowReprintConfirm(false);
     try {
       window.print();
     } catch (err) {
@@ -604,6 +611,48 @@ export const POSView: React.FC<POSViewProps> = ({ currentUser }) => {
           onPrintSuccess={handlePrintSuccess}
           autoCloseOnPrint={true}
         />
+      )}
+
+      {/* Confirmation Dialog for Reprint to prevent accidental print jobs */}
+      {showReprintConfirm && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-2xl border border-slate-200 text-center space-y-4 animate-in fade-in zoom-in-95 duration-150">
+            <div className="w-12 h-12 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center mx-auto">
+              <Printer className="w-6 h-6" />
+            </div>
+            <div className="space-y-1.5">
+              <h3 className="text-base font-bold text-slate-900">
+                Confirmar Reimpressão?
+              </h3>
+              <p className="text-xs text-slate-600 leading-relaxed">
+                {lastPrintJob
+                  ? `Deseja reenviar para a impressora o ingresso ${lastPrintJob.ticketLabel}?`
+                  : 'Deseja reenviar o comando de impressão para a impressora vinculada?'}
+              </p>
+              <p className="text-[11px] text-slate-400">
+                Verifique se a impressora possui papel antes de prosseguir.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2.5 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowReprintConfirm(false)}
+                className="w-full py-2.5 px-4 rounded-xl border border-slate-300 text-slate-700 font-semibold text-xs hover:bg-slate-100 transition-colors cursor-pointer"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={executeReprint}
+                className="w-full py-2.5 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow-xs transition-all cursor-pointer flex items-center justify-center gap-1.5"
+              >
+                <Printer className="w-3.5 h-3.5" />
+                <span>Reimprimir</span>
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
