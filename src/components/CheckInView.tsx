@@ -68,13 +68,21 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
     status: 'VALID' | 'ALREADY_USED' | 'INVALID' | 'CANCELLED';
   }[]>([]);
 
+  const [queueCount, setQueueCount] = useState<number>(0);
+  const [isReaderBusy, setIsReaderBusy] = useState<boolean>(false);
+
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const animFrameRef = useRef<number | null>(null);
-  const isPausedDecodingRef = useRef<boolean>(false);
+  const isReaderDisabledRef = useRef<boolean>(false);
+  const isProcessingRef = useRef<boolean>(false);
+  const queueRef = useRef<{ id: string; code: string; timestamp: number }[]>([]);
   const lastProcessedCodeRef = useRef<{ code: string; time: number }>({ code: '', time: 0 });
-  const nextScanTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const selectedEventIdRef = useRef(selectedEventId);
+  selectedEventIdRef.current = selectedEventId;
+  const currentUserRef = useRef(currentUser);
+  currentUserRef.current = currentUser;
 
   const currentEvent = allEvents.find(e => e.id === selectedEventId);
 
@@ -149,13 +157,10 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
 
   // Start Camera - keep continuous stream alive
   const startCamera = async () => {
-    if (nextScanTimerRef.current) {
-      clearTimeout(nextScanTimerRef.current);
-      nextScanTimerRef.current = null;
-    }
     setCameraError('');
     setIsScanning(true);
-    isPausedDecodingRef.current = false;
+    isReaderDisabledRef.current = false;
+    setIsReaderBusy(false);
     setValidationResult(null);
     setConfirmedSuccess(false);
 
@@ -179,11 +184,8 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
 
   // Stop Camera
   const stopCamera = () => {
-    if (nextScanTimerRef.current) {
-      clearTimeout(nextScanTimerRef.current);
-      nextScanTimerRef.current = null;
-    }
-    isPausedDecodingRef.current = false;
+    isReaderDisabledRef.current = false;
+    setIsReaderBusy(false);
     if (animFrameRef.current) {
       cancelAnimationFrame(animFrameRef.current);
       animFrameRef.current = null;
@@ -195,12 +197,13 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
     setIsScanning(false);
   };
 
-  // High-performance QR Code detection via canvas without stopping stream
+  // Leitura contínua em alto desempenho via canvas
   const tickScanner = () => {
     if (videoRef.current && videoRef.current.readyState === videoRef.current.HAVE_ENOUGH_DATA) {
       const video = videoRef.current;
       const canvas = canvasRef.current;
-      if (canvas && !isPausedDecodingRef.current) {
+      // O leitor só processa quando NÃO estiver desabilitado durante a transação atômica
+      if (canvas && !isReaderDisabledRef.current) {
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
         const ctx = canvas.getContext('2d', { willReadFrequently: true });
@@ -212,16 +215,7 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
           });
 
           if (code && code.data && code.data.trim()) {
-            const rawData = code.data.trim();
-            const now = Date.now();
-            // Prevent immediate repeated scanning of the exact same code within 2.5s
-            if (rawData === lastProcessedCodeRef.current.code && now - lastProcessedCodeRef.current.time < 2500) {
-              // Wait before re-reading identical code
-            } else {
-              lastProcessedCodeRef.current = { code: rawData, time: now };
-              isPausedDecodingRef.current = true;
-              handleProcessCode(rawData);
-            }
+            enqueueCode(code.data.trim(), 'CAMERA');
           }
         }
       }
@@ -235,30 +229,60 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
     };
   }, []);
 
-  const handleProcessCode = async (codeStr: string) => {
+  // Fila de processamento assíncrona: enfileiramento
+  const enqueueCode = (codeStr: string, source: 'CAMERA' | 'MANUAL' = 'CAMERA') => {
     const clean = codeStr.trim();
-    if (!clean) {
-      isPausedDecodingRef.current = false;
+    if (!clean) return;
+
+    const now = Date.now();
+    // Proteção contra leitura repetida do mesmo QR code na câmera enquanto permanecer no enquadramento
+    if (source === 'CAMERA') {
+      if (clean === lastProcessedCodeRef.current.code && now - lastProcessedCodeRef.current.time < 1500) {
+        return;
+      }
+    }
+
+    // Evita duplicatas pendentes na fila
+    if (queueRef.current.some(item => item.code === clean)) {
       return;
     }
 
-    if (nextScanTimerRef.current) {
-      clearTimeout(nextScanTimerRef.current);
-      nextScanTimerRef.current = null;
-    }
+    lastProcessedCodeRef.current = { code: clean, time: now };
+    queueRef.current.push({
+      id: `queue-${now}-${Math.random().toString(36).substring(2, 6)}`,
+      code: clean,
+      timestamp: now
+    });
+    setQueueCount(queueRef.current.length);
 
-    setConfirmedSuccess(false);
+    // Aciona a fila assíncrona
+    processQueue();
+  };
+
+  // Trabalhador assíncrono da fila: executa a transação atômica no Firestore
+  const processQueue = async () => {
+    if (isProcessingRef.current) return;
+    if (queueRef.current.length === 0) return;
+
+    const nextItem = queueRef.current.shift();
+    setQueueCount(queueRef.current.length);
+    if (!nextItem) return;
+
+    isProcessingRef.current = true;
+    // 1. DESABILITA O LEITOR APENAS DURANTE A TRANSAÇÃO ATÔMICA NO FIRESTORE
+    isReaderDisabledRef.current = true;
+    setIsReaderBusy(true);
     setIsValidating(true);
 
     try {
       const res = await StorageService.validateTicketAsync(
-        clean,
-        selectedEventId === 'all' ? undefined : selectedEventId,
-        currentUser
+        nextItem.code,
+        selectedEventIdRef.current === 'all' ? undefined : selectedEventIdRef.current,
+        currentUserRef.current
       );
       setValidationResult(res);
 
-      // Audio feedback & state
+      // Feedback sonoro & estado
       if (res.status === 'VALID') {
         setConfirmedSuccess(true);
         playFeedbackSound('success');
@@ -268,11 +292,11 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
         playFeedbackSound('error');
       }
 
-      // Add to recent scans log
+      // Adiciona ao histórico de leituras recentes
       setRecentScans(prev => [
         {
-          id: `scan-${Date.now()}`,
-          code: clean,
+          id: `scan-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
+          code: nextItem.code,
           customer: res.ticket?.customerName || 'Não identificado',
           ticketType: res.ticket?.ticketTypeName || '-',
           time: new Date().toLocaleTimeString('pt-BR'),
@@ -280,22 +304,28 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
         },
         ...prev.slice(0, 9)
       ]);
-
-      // If continuous mode is enabled and camera is scanning:
-      // Automatically reset result after 1.5s so the next ticket can be read immediately with zero friction
-      if (continuousMode && streamRef.current) {
-        nextScanTimerRef.current = setTimeout(() => {
-          setValidationResult(null);
-          setConfirmedSuccess(false);
-          isPausedDecodingRef.current = false;
-        }, 1500);
-      }
     } catch (err) {
-      console.error('Validation error:', err);
-      isPausedDecodingRef.current = false;
+      console.error('Erro na transação de validação atômica:', err);
     } finally {
       setIsValidating(false);
+      isProcessingRef.current = false;
+
+      // 2. REATIVAÇÃO IMEDIATA DO LEITOR após o retorno da validação para permitir leituras sequenciais rápidas!
+      isReaderDisabledRef.current = false;
+      setIsReaderBusy(false);
+
+      // Se houver mais códigos aguardando na fila, processa o próximo sem atraso
+      if (queueRef.current.length > 0) {
+        processQueue();
+      }
     }
+  };
+
+  const handleManualSubmit = () => {
+    if (!manualCode.trim() || isValidating) return;
+    const clean = manualCode.trim();
+    setManualCode('');
+    enqueueCode(clean, 'MANUAL');
   };
 
   const handleConfirmEntry = () => {
@@ -309,14 +339,11 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
   };
 
   const handleNextScan = () => {
-    if (nextScanTimerRef.current) {
-      clearTimeout(nextScanTimerRef.current);
-      nextScanTimerRef.current = null;
-    }
     setValidationResult(null);
     setConfirmedSuccess(false);
     setManualCode('');
-    isPausedDecodingRef.current = false;
+    isReaderDisabledRef.current = false;
+    setIsReaderBusy(false);
 
     // If camera stream is not running, start it
     if (!streamRef.current || !isScanning) {
@@ -444,15 +471,37 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
               <canvas ref={canvasRef} className="hidden" />
 
               {/* Scanning visual crosshair overlay */}
-              <div className="absolute inset-0 pointer-events-none flex flex-col items-center justify-center p-8">
-                <div className="w-48 h-48 border-2 border-emerald-400 rounded-xl relative animate-pulse">
+              <div className="absolute inset-0 pointer-events-none flex flex-col items-center justify-between p-4 sm:p-6">
+                {/* Live reader & queue status indicator */}
+                <div className="w-full flex justify-between items-center z-10">
+                  {isReaderBusy ? (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-amber-500/95 text-white text-[11px] font-bold shadow-md backdrop-blur-xs animate-pulse">
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                      <span>Validando transação...</span>
+                    </span>
+                  ) : (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-emerald-600/95 text-white text-[11px] font-bold shadow-md backdrop-blur-xs">
+                      <span className="w-2 h-2 rounded-full bg-white animate-ping"></span>
+                      <span>Leitor Ativo (Sequencial)</span>
+                    </span>
+                  )}
+
+                  {queueCount > 0 && (
+                    <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-indigo-600 text-white text-[11px] font-bold shadow-md">
+                      <span>Fila: {queueCount}</span>
+                    </span>
+                  )}
+                </div>
+
+                <div className="w-48 h-48 border-2 border-emerald-400 rounded-xl relative animate-pulse my-auto">
                   <div className="absolute -top-1 -left-1 w-5 h-5 border-t-4 border-l-4 border-emerald-400"></div>
                   <div className="absolute -top-1 -right-1 w-5 h-5 border-t-4 border-r-4 border-emerald-400"></div>
                   <div className="absolute -bottom-1 -left-1 w-5 h-5 border-b-4 border-l-4 border-emerald-400"></div>
                   <div className="absolute -bottom-1 -right-1 w-5 h-5 border-b-4 border-r-4 border-emerald-400"></div>
                 </div>
-                <p className="text-xs text-white/90 font-semibold mt-4 bg-black/60 px-3 py-1 rounded-full">
-                  Aponte a câmera para o QR Code do ingresso
+
+                <p className="text-xs text-white/95 font-semibold bg-black/70 px-3 py-1 rounded-full text-center">
+                  {isReaderBusy ? 'Aguardando confirmação atômica...' : 'Aponte a câmera para o QR Code do ingresso'}
                 </p>
               </div>
             </div>
@@ -511,13 +560,13 @@ export const CheckInView: React.FC<CheckInViewProps> = ({ currentUser }) => {
                     placeholder="Ex: EVT-2026-000101 ou TKT-8F72A9C4-..."
                     value={manualCode}
                     onChange={e => setManualCode(e.target.value)}
-                    onKeyDown={e => e.key === 'Enter' && handleProcessCode(manualCode)}
+                    onKeyDown={e => e.key === 'Enter' && handleManualSubmit()}
                     className="w-full pl-9 pr-3 py-2.5 rounded-xl border border-slate-300 text-sm font-mono focus:ring-2 focus:ring-indigo-500 uppercase"
                   />
                 </div>
                 <button
                   type="button"
-                  onClick={() => handleProcessCode(manualCode)}
+                  onClick={handleManualSubmit}
                   disabled={!manualCode.trim() || isValidating}
                   className="px-5 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 disabled:opacity-40 text-white text-sm font-bold transition-colors cursor-pointer inline-flex items-center gap-2"
                 >
